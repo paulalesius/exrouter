@@ -34,6 +34,7 @@ backends:
       - "/v1/tokenize"
       - "/v1/detokenize"
     script: "/src/exrouter/samples/hook.py"
+    remapper: "/src/exrouter/samples/llm-think-strip-remapper.py"
     locks: [stt_custom]
 
   # stt_custom is a custom endpoint that takes a POST

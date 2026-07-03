@@ -1,8 +1,10 @@
 """EXRouter - routes requests to backends with global locking and optional request remapping."""
 
 import asyncio
+import json
 import logging
 import time
+import re
 
 from dataclasses import dataclass
 from typing import Optional
@@ -19,6 +21,39 @@ from .hooks import HookLoader, HookContext
 from .remapper import RemapperLoader, RemapResult
 
 logger = logging.getLogger("exrouter")
+
+
+def strip_thinking_at_start(text: str) -> str:
+    """Strip thinking blocks only at the START of text.
+    
+    Handles both formats:
+    - <think>...</think>
+    - <think>...</think>
+    - <reasoning>...</reasoning>
+    
+    Only removes if the tag is at position 0 (after optional whitespace).
+    """
+    # Pattern matches opening tag at start, captures everything after closing tag
+    # Note: No \s* required AFTER opening tag (e.g.,  not  )
+    patterns = [
+        #  format (closing tag is )
+        r'^\s*<think>(.*?)\s*</think>\s*(.*)',
+        #  format  (closing tag is </reasoning>)
+        r'^\s*<think\b[^>]*>(.*?)\s*</think>\s*(.*)',
+        #  format
+        r'^\s*<reasoning\b[^>]*>(.*?)\s*</reasoning>\s*(.*)',
+        #  format (self-closing or paired tags)
+        r'^\s*</?think\s*>(.*?)\s*</?think\s*>\s*(.*)',
+    ]
+    
+    for pattern in patterns:
+        match = re.match(pattern, text, re.DOTALL | re.IGNORECASE)
+        if match:
+            # Return content after the closing tag
+            return match.group(2).strip()
+    
+    # No thinking tag at start, return as-is
+    return text
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -218,7 +253,8 @@ class LockProxy:
                         hook_context.request_headers.update(result.headers)
                     if result.body is not None:
                         hook_context.request_body = result.body
-                        request_body = result.body  # use for forwarding
+                        request_body = result.body
+                        hook_context.request_headers["content-length"] = str(len(result.body))
 
         # 3. Get locks for the (possibly remapped) backend
         lock_targets = backend.get_lock_targets(self.backends)
@@ -287,8 +323,30 @@ class LockProxy:
             status_code = response.status_code
             content_type = response.headers.get("content-type", "")
 
+            # Read response body for remapper
+            response_body = await response.aread()
+            
             hook_context.response_status = status_code
             hook_context.response_headers = dict(response.headers)
+            hook_context.response_body = response_body
+
+            # NEW: Run response remapper (if configured) AFTER receiving backend response
+            if backend.remapper:
+                remapper_instance = self.remapper_loader.get_remapper(backend.name)
+                if remapper_instance:
+                    result: Optional[RemapResult] = await self.remapper_loader.call_remap(
+                        remapper_instance, hook_context
+                    )
+                    if result:
+                        # Use remapped response
+                        content = result.content
+                        if isinstance(content, str):
+                            content = content.encode("utf-8")
+                        return Response(
+                            status_code=result.status_code or status_code,
+                            content=content or b"",
+                            headers=result.response_headers or {}
+                        )
 
             if backend.script:
                 await self.hook_loader.call_hook(
@@ -306,15 +364,17 @@ class LockProxy:
 
             if "text/event-stream" in content_type:
                 return StreamingResponse(
-                    self._stream_sse(response.aiter_lines()),
+                    self._stream_sse(response.aiter_lines(), backend.name),
                     status_code=status_code,
                     media_type="text/event-stream",
                     headers=dict(response.headers)
                 )
             else:
-                return StreamingResponse(
-                    self._stream_response(response.aiter_bytes()),
+                # If remapper didn't return a result, return the original response
+                # response_body is already read, so return it directly
+                return Response(
                     status_code=status_code,
+                    content=response_body,
                     headers=dict(response.headers)
                 )
 
@@ -358,13 +418,81 @@ class LockProxy:
                         hook_context
                     )
 
-    async def _stream_sse(self, aiter_lines):
-        async for line in aiter_lines:
-            yield line + "\n"
+    async def _stream_sse(self, aiter_lines, backend_name: str = None):
+        """Stream SSE, using remapper's stripper if available."""
+        stripper = None
+        if backend_name:
+            remapper = self.remapper_loader.get_remapper(backend_name)
+            if remapper and hasattr(remapper, "get_streaming_stripper"):
+                stripper = remapper.get_streaming_stripper()
 
-    async def _stream_response(self, aiter_bytes):
+        async for line in aiter_lines:
+            if not line.startswith("data: "):
+                yield line + "\n"
+                continue
+
+            json_part = line[6:].strip()
+            if not json_part or json_part == "[DONE]":
+                yield line + "\n"
+                continue
+
+            try:
+                chunk = json.loads(json_part)
+
+                if "choices" in chunk:
+                    for choice in chunk.get("choices", []):
+                        if "delta" in choice and "content" in choice["delta"]:
+                            content = choice["delta"]["content"] or ""
+                            if stripper:
+                                stripped = stripper.process_chunk(content)
+                                if stripped is not None:
+                                    choice["delta"]["content"] = stripped
+                                else:
+                                    continue  # still buffering think block
+                            # else: no stripper, pass through
+
+                yield "data: " + json.dumps(chunk) + "\n\n"
+
+            except json.JSONDecodeError:
+                yield line + "\n"
+
+    async def _stream_response(self, aiter_bytes, backend_name: str = None):
+        """Stream regular responses, optionally stripping thinking tags."""
+        stripper = None
+        if backend_name:
+            remapper = self.remapper_loader.get_remapper(backend_name)
+            if remapper and hasattr(remapper, 'get_streaming_stripper'):
+                stripper = remapper.get_streaming_stripper()
+        
+        buffer = ""
         async for chunk in aiter_bytes:
-            yield chunk
+            chunk_str = chunk.decode('utf-8', errors='replace')
+            buffer += chunk_str
+            
+            # Try to parse as JSON and strip thinking tags
+            try:
+                data = json.loads(buffer)
+                if "choices" in data:
+                    for choice in data.get("choices", []):
+                        if "text" in choice:
+                            choice["text"] = strip_thinking_at_start(choice["text"])
+                        elif "message" in choice and "content" in choice["message"]:
+                            choice["message"]["content"] = strip_thinking_at_start(
+                                choice["message"]["content"]
+                            )
+                buffer = json.dumps(data)
+            except json.JSONDecodeError:
+                # Not complete JSON yet, continue buffering
+                pass
+            
+            # Apply streaming stripper if available
+            if stripper:
+                stripped = stripper.process_chunk(buffer)
+                if stripped is not None:
+                    yield stripped.encode('utf-8')
+                    buffer = ""
+            else:
+                yield chunk
 
     async def shutdown(self):
         await self.httpx_client.aclose()
