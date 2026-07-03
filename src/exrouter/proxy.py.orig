@@ -321,27 +321,16 @@ class LockProxy:
 
             elapsed = time.time() - start_time
             status_code = response.status_code
-            content_type = response.headers.get("content-type", "").lower()
+            content_type = response.headers.get("content-type", "")
 
+            # Read response body for remapper
+            response_body = await response.aread()
+            
             hook_context.response_status = status_code
             hook_context.response_headers = dict(response.headers)
+            hook_context.response_body = response_body
 
-            # Only fully buffer non-streaming responses.
-            # For SSE (text/event-stream), we must NOT call aread() so that
-            # aiter_lines() can stream chunks incrementally from the backend
-            # as they arrive. This enables true streaming to clients.
-            if "text/event-stream" not in content_type:
-                response_body = await response.aread()
-                hook_context.response_body = response_body
-            else:
-                response_body = b""
-                hook_context.response_body = None
-
-            # Run response remapper (if configured).
-            # For SSE responses, response_body is None so remappers that
-            # check `if context.response_body:` (like the think-strip one)
-            # will skip full-body processing and fall through to the
-            # StreamingResponse path (which uses incremental stripper).
+            # NEW: Run response remapper (if configured) AFTER receiving backend response
             if backend.remapper:
                 remapper_instance = self.remapper_loader.get_remapper(backend.name)
                 if remapper_instance:
@@ -349,6 +338,7 @@ class LockProxy:
                         remapper_instance, hook_context
                     )
                     if result:
+                        # Use remapped response
                         content = result.content
                         if isinstance(content, str):
                             content = content.encode("utf-8")
@@ -380,6 +370,8 @@ class LockProxy:
                     headers=dict(response.headers)
                 )
             else:
+                # If remapper didn't return a result, return the original response
+                # response_body is already read, so return it directly
                 return Response(
                     status_code=status_code,
                     content=response_body,
