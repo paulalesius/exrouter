@@ -87,7 +87,7 @@ backends:
     locks: []
 
   tts:
-    url: "http://127.0.0.1:8085"
+    url: "http://127.0.0.1:7852"
     paths:
       - "/v1/audio/speech"
     locks: []
