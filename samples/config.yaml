@@ -33,9 +33,25 @@ backends:
       - "/health"
       - "/v1/tokenize"
       - "/v1/detokenize"
-    script: "/src/exrouter/samples/hook.py"
+    #script: "/src/exrouter/samples/hook.py"
     remapper: "/src/exrouter/samples/llm-think-strip-remapper.py"
     locks: [stt_custom]
+    lifecycle:
+      on_activate:
+        systemd:
+          start: [llama-server.service]
+        shell:
+          - |
+            echo "Example on_activate script too"
+            sleep 1
+      on_deactivate:
+        systemd:
+          stop: [llama-server.service]
+      wait_for:
+        - type: port
+          host: 127.0.0.1
+          port: 8080
+          timeout: 20
 
   # stt_custom is a custom endpoint that takes a POST
   # request to /transcribe and returns the result. It locks
@@ -43,11 +59,16 @@ backends:
   # will stop the llm.service and start stt_custom.service before
   # entering the backend.
   stt_custom:
-    url: "http://127.0.0.1:8091"
-    paths:
-      - "/transcribe"
-    script: "/src/exrouter/samples/hook.py"
+    url: "http://127.0.0.1:7301"
+    paths: ["/transcribe"]
     locks: [llm]
+    lifecycle:
+      on_activate:
+        systemd:
+          start: [stt-custom.target]
+      on_deactivate:
+        systemd:
+          stop: [stt-custom.target]
 
   # Demonstration of a llama-server, the paths are TEI paths, but
   # we use a remapper to remap to llama-server paths

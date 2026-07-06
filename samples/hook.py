@@ -42,12 +42,12 @@ class BackendHook:
 
         if backend == "stt_custom":
             print("[HOOK] stt_custom ACTIVATED → starting stt_custom.service, stopping llm.service")
-            self._switch_services(active="stt_custom.service", inactive="llama-server.service")
+            self._switch_services(active="stt-custom.target", inactive="llama-server.service")
             self._wait_for_port("127.0.0.1", 8091, timeout=20)
 
         elif backend == "llm":
             print("[HOOK] llm ACTIVATED → starting llama-server.service")
-            self._switch_services(active="llama-server.service", inactive="stt_custom.service")
+            self._switch_services(active="llama-server.service", inactive="stt-custom.target")
             self._wait_for_port("127.0.0.1", 8080, timeout=20)
 
     def _switch_services(self, active: str, inactive: str) -> None:

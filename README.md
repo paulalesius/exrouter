@@ -103,6 +103,47 @@ Each backend specifies:
 - `script` (optional): Path to Python hook script for lifecycle callbacks (e.g. dynamic model load/unload)
 - `remapper` (optional): Path to Python request remapper script
 
+### Declarative Lifecycle Management
+
+Instead of (or in addition to) writing Python hook scripts, you can declaratively manage backend services using the `lifecycle:` key:
+
+```yaml
+llm:
+  url: http://127.0.0.1:8080
+  paths:
+    - /v1/chat/completions
+  locks: [stt_custom]
+  lifecycle:
+    on_activate:
+      systemd:
+        start: [llama-server.service]
+      wait_for:
+        - type: port
+          host: 127.0.0.1
+          port: 8080
+          timeout: 30
+    on_deactivate:
+      systemd:
+        stop: [llama-server.service]
+
+stt_custom:
+  url: http://127.0.0.1:7301
+  paths: [/transcribe]
+  locks: [llm]
+  lifecycle:
+    on_activate:
+      systemd:
+        start: [stt-custom.target]
+      wait_for:
+        - type: port
+          host: 127.0.0.1
+          port: 7301
+          timeout: 30
+    on_deactivate:
+      systemd:
+        stop: [stt-custom.target]
+ ```
+
 ### Request Remappers
 
 Request remappers allow you to intercept and transform requests **before** they reach a backend. This is powerful for API compatibility.

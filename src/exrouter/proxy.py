@@ -16,8 +16,9 @@ import httpx
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from .backend import Backend
-from .config import Config
+from .config import Config, LifecycleConfig
 from .hooks import HookLoader, HookContext
+from .lifecycle import LifecycleExecutor
 from .remapper import RemapperLoader, RemapResult
 
 logger = logging.getLogger("exrouter")
@@ -162,6 +163,12 @@ class LockProxy:
             if backend.remapper:
                 self.remapper_loader.load_script(backend.name, backend.remapper)
 
+        # Initialize declarative lifecycle executor (systemd/shell/wait)
+        self.lifecycle_executor = LifecycleExecutor()
+        self.lifecycle_configs: dict[str, Optional[LifecycleConfig]] = {}
+        for name, backend_config in config.backends.items():
+            self.lifecycle_configs[name] = backend_config.lifecycle
+
         # Track in-flight requests per backend
         self.active_counts: dict[str, int] = {name: 0 for name in self.backends}
 
@@ -284,6 +291,37 @@ class LockProxy:
                     self.hook_loader.get_hook(backend.name),
                     "on_backend_activated",
                     hook_context
+                )
+
+            # === IMPORTANT ORDERING FOR RESOURCE CONTENTION ===
+            # When activating a backend that locks other backends, we MUST:
+            # 1. FIRST stop the locked backends (free their resources / VRAM / GPU)
+            # 2. THEN start/activate the current backend (its on_activate + wait_for its port)
+            #
+            # This prevents the new service from starting while the conflicting one
+            # is still holding resources (the previous bug).
+            # The systemctl stop waits for systemd to process the stop (up to 30s),
+            # and the activating backend's own wait_for: port will further wait until
+            # its port is ready (implicitly waiting for resources to be truly free).
+
+            # 1. Stop all locked backends first (auto on_deactivate)
+            for locked_name in lock_targets:
+                locked_lifecycle = self.lifecycle_configs.get(locked_name)
+                if locked_lifecycle and locked_lifecycle.on_deactivate:
+                    logger.info(
+                        f"[{backend.name}] Stopping locked backend '{locked_name}' first "
+                        f"(to free resources before activating)"
+                    )
+                    await self.lifecycle_executor.execute(
+                        locked_name, locked_lifecycle.on_deactivate, is_activate=False
+                    )
+
+            # 2. THEN activate self (start own service + its wait_for conditions)
+            # Declarative lifecycle actions (runs in addition to hook if both configured)
+            lifecycle = self.lifecycle_configs.get(backend.name)
+            if lifecycle and lifecycle.on_activate:
+                await self.lifecycle_executor.execute(
+                    backend.name, lifecycle.on_activate, is_activate=True
                 )
 
         try:
@@ -425,6 +463,35 @@ class LockProxy:
                         "on_backend_deactivated",
                         hook_context
                     )
+                # Declarative lifecycle actions
+                lifecycle = self.lifecycle_configs.get(backend.name)
+                if lifecycle and lifecycle.on_deactivate:
+                    # For backends that declare `locks:` (mutually exclusive group like llm <-> stt_custom),
+                    # do NOT automatically stop them when their request count goes to zero.
+                    # They should remain running ("stay in this mode") until another conflicting
+                    # backend activates (which will stop them first via the "stop locked first" logic).
+                    #
+                    # This matches the expectation: once stt_custom is active, it stays
+                    # active (service running) until something that locks it needs to run.
+                    if not backend.locks:
+                        await self.lifecycle_executor.execute(
+                            backend.name, lifecycle.on_deactivate, is_activate=False
+                        )
+
+                # Note: We intentionally do NOT auto-trigger on_activate for the previously
+                # locked backends here. 
+                # 
+                # Reason: On quick failures (connection error, timeout, etc.) this would
+                # immediately restart the previously stopped service (as you saw with llama-server
+                # coming back after the failed /transcribe). 
+                # 
+                # The critical & safe behavior is only the other direction:
+                #   "When I activate and I lock something → first stop the locked ones"
+                # This prevents resource contention and matches the spirit of your original hook.py.
+                #
+                # If you want the "switch back to alternative when this one goes idle" behavior,
+                # you can add it in a custom hook's on_backend_deactivated, or we can make it
+                # optional via a config flag later.
 
     async def _stream_sse(self, aiter_lines, backend_name: str = None):
         """Stream SSE, using remapper's stripper if available."""
