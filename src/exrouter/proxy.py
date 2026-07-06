@@ -5,15 +5,20 @@ import json
 import logging
 import time
 import re
+from urllib.parse import urlparse
+
+import websockets
+from websockets.exceptions import ConnectionClosed, InvalidStatusCode
 
 from dataclasses import dataclass
 from typing import Optional
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
 import httpx
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.websockets import WebSocketState
 
 from .backend import Backend
 from .config import Config, LifecycleConfig
@@ -182,6 +187,13 @@ class LockProxy:
         # Track in-flight requests per backend
         self.active_counts: dict[str, int] = {name: 0 for name in self.backends}
 
+        # Clean activation tracking (proper components)
+        # - active_counts: tracks in-flight requests (used only for LockManager self-locks)
+        # - activated_backends: backends that have run their on_activate lifecycle.
+        #   They stay activated until another backend that locks them forces deactivation.
+        #   This prevents repeated lifecycle spam on chatty frontends like Open WebUI.
+        self.activated_backends: set[str] = set()
+
         # Shared httpx client
         self.httpx_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
@@ -208,38 +220,51 @@ class LockProxy:
         async def proxy_request(request: Request, path: str):
             return await self._handle_request(request, path)
 
-    def _find_backend(self, request: Request, path: str) -> Optional[Backend]:
-        """Select backend using combined domain + path matching.
-        
-        Rules (as requested):
-        - If the incoming request's Host header matches ANY backend's declared `domain`,
-          then ONLY backends that declare a matching domain are eligible.
-        - Pure path-based backends (no `domain:` declared) are ignored in that case.
-        - Multiple backends can share the same domain but use different `paths:`.
-        - If no declared domain matches the request Host, fall back to pure path matching
-          (original behavior for stt_custom, llm, etc.).
+        @self.app.websocket("/{path:path}")
+        async def proxy_websocket(websocket: WebSocket, path: str):
+            await self._handle_websocket(websocket, path)
+
+    def _find_backend(self, host: str, path: str) -> Optional[Backend]:
+        """Robust domain + path matching.
+
+        Uses Backend.matches_path() so that paths: ["/"] correctly matches everything.
         """
-        host = request.headers.get("host", "")
-        
-        # Step 1: Does this request's Host match any backend that declares domains?
-        request_matches_some_domain = any(
-            b.domain and b.matches_domain(host) for b in self.backends.values()
+        import fnmatch
+
+        raw_host = host or ""
+        host_no_port = raw_host.lower().split(":")[0]
+        full_path = f"/{path}" if not path.startswith("/") else path
+
+        domain_matched = []
+        path_only = []
+
+        for backend in self.backends.values():
+            domains = backend.domain
+            if isinstance(domains, str):
+                domains = [domains]
+            if not domains:
+                domains = []
+
+            matched_domain = False
+            for d in domains:
+                d_clean = str(d).lower().split(":")[0]
+                if fnmatch.fnmatch(host_no_port, d_clean):
+                    domain_matched.append(backend)
+                    matched_domain = True
+                    break
+
+            if not matched_domain:
+                path_only.append(backend)
+
+        candidates = domain_matched if domain_matched else path_only
+
+        for backend in candidates:
+            if backend.matches_path(full_path):   # ← Use the proper method
+                return backend
+
+        logger.warning(
+            f"No backend matched host+path for Host={raw_host} path={full_path}"
         )
-        
-        for b in self.backends.values():
-            domain_ok = True
-            if b.domain:
-                # Backend declares domains → must match the request Host
-                domain_ok = b.matches_domain(host)
-            else:
-                # Backend has NO domain declared (pure path backend like stt_custom)
-                if request_matches_some_domain:
-                    # A domain was specified in the request → skip pure path backends
-                    domain_ok = False
-            
-            path_ok = b.matches_path(path)
-            if domain_ok and path_ok:
-                return b
         return None
 
     async def _handle_request(self, request: Request, path: str) -> Response:
@@ -252,7 +277,8 @@ class LockProxy:
         #    - If backend has no `domain:` (empty), only path matching is required (legacy behavior).
         #    This design allows multiple backends to share the same domain name but serve
         #    different paths (e.g. api.example.com/v1/chat vs api.example.com/v1/embed).
-        backend: Optional[Backend] = self._find_backend(request, full_path)
+        host = request.headers.get("host", "")
+        backend: Optional[Backend] = self._find_backend(host, full_path)
 
         if not backend:
             logger.warning(
@@ -332,10 +358,10 @@ class LockProxy:
                 headers={"Retry-After": "10"}
             )
 
-        # 5. Backend activation tracking
-        was_active = self.active_counts.get(backend.name, 0) > 0
-        self.active_counts[backend.name] = self.active_counts.get(backend.name, 0) + 1
-        if not was_active:
+        # === Clean activation using activated_backends component ===
+        if backend.name not in self.activated_backends:
+            self.activated_backends.add(backend.name)
+
             if backend.script:
                 await self.hook_loader.call_hook(
                     self.hook_loader.get_hook(backend.name),
@@ -343,25 +369,10 @@ class LockProxy:
                     hook_context
                 )
 
-            # Mark this backend as busy in the lock manager (self-lock).
-            # This ensures that any other backend that declares this one in its `locks:`
-            # list will properly wait in acquire() until we go idle.
-            # Without this, a contender could start while we still have in-flight requests.
             if self.lock_manager:
                 await self.lock_manager.acquire(backend.name, [backend.name])
 
-            # === IMPORTANT ORDERING FOR RESOURCE CONTENTION ===
-            # When activating a backend that locks other backends, we MUST:
-            # 1. FIRST stop the locked backends (free their resources / VRAM / GPU)
-            # 2. THEN start/activate the current backend (its on_activate + wait_for its port)
-            #
-            # This prevents the new service from starting while the conflicting one
-            # is still holding resources (the previous bug).
-            # The systemctl stop waits for systemd to process the stop (up to 30s),
-            # and the activating backend's own wait_for: port will further wait until
-            # its port is ready (implicitly waiting for resources to be truly free).
-
-            # 1. Stop all locked backends first (auto on_deactivate)
+            # Stop backends this one locks (resource contention declared via `locks:`)
             for locked_name in lock_targets:
                 locked_lifecycle = self.lifecycle_configs.get(locked_name)
                 if locked_lifecycle and locked_lifecycle.on_deactivate:
@@ -373,13 +384,15 @@ class LockProxy:
                         locked_name, locked_lifecycle.on_deactivate, is_activate=False
                     )
 
-            # 2. THEN activate self (start own service + its wait_for conditions)
-            # Declarative lifecycle actions (runs in addition to hook if both configured)
+            # Activate self
             lifecycle = self.lifecycle_configs.get(backend.name)
             if lifecycle and lifecycle.on_activate:
                 await self.lifecycle_executor.execute(
                     backend.name, lifecycle.on_activate, is_activate=True
                 )
+
+        # Increment in-flight count (used only for LockManager self-lock coordination)
+        self.active_counts[backend.name] = self.active_counts.get(backend.name, 0) + 1
 
         try:
             # Call lifecycle hooks on the final backend
@@ -552,34 +565,15 @@ class LockProxy:
                     hook_context
                 )
 
-            # Deactivation tracking
-            self.active_counts[backend.name] = self.active_counts.get(backend.name, 1) - 1
+            # Decrement in-flight count.
+            # Only release self-lock when we reach zero in-flight requests.
+            # We NEVER run on_deactivate or stop the service here.
+            # Deactivation only happens when another backend that has this one in its `locks:` list activates.
+            self.active_counts[backend.name] = max(0, self.active_counts.get(backend.name, 1) - 1)
             if self.active_counts[backend.name] <= 0:
                 self.active_counts[backend.name] = 0
                 if self.lock_manager:
-                    # Release our self-lock so that any backend locking us can now acquire
                     await self.lock_manager.release(backend.name, [backend.name])
-
-                if backend.script:
-                    await self.hook_loader.call_hook(
-                        self.hook_loader.get_hook(backend.name),
-                        "on_backend_deactivated",
-                        hook_context
-                    )
-                # Declarative lifecycle actions
-                lifecycle = self.lifecycle_configs.get(backend.name)
-                if lifecycle and lifecycle.on_deactivate:
-                    # For backends that declare `locks:` (mutually exclusive group like llm <-> stt_custom),
-                    # do NOT automatically stop them when their request count goes to zero.
-                    # They should remain running ("stay in this mode") until another conflicting
-                    # backend activates (which will stop them first via the "stop locked first" logic).
-                    #
-                    # This matches the expectation: once stt_custom is active, it stays
-                    # active (service running) until something that locks it needs to run.
-                    if not backend.locks:
-                        await self.lifecycle_executor.execute(
-                            backend.name, lifecycle.on_deactivate, is_activate=False
-                        )
 
                 # Note: We intentionally do NOT auto-trigger on_activate for the previously
                 # locked backends here. 
@@ -595,6 +589,204 @@ class LockProxy:
                 # If you want the "switch back to alternative when this one goes idle" behavior,
                 # you can add it in a custom hook's on_backend_deactivated, or we can make it
                 # optional via a config flag later.
+
+    async def _handle_websocket(self, websocket: WebSocket, path: str) -> None:
+        """Handle bidirectional WebSocket proxy with full header forwarding (correct reverse proxy behavior)."""
+        full_path = f"/{path}"
+        host = websocket.headers.get("host", "")
+
+        backend: Optional[Backend] = self._find_backend(host, full_path)
+        if not backend:
+            await websocket.close(code=1008, reason=f"Unknown path: {full_path}")
+            return
+
+        hook_context = HookContext(
+            backend_name=backend.name,
+            request_method="GET",
+            request_path=full_path,
+            request_headers=dict(websocket.headers),
+            request_body=None
+        )
+
+        if backend.remapper:
+            remapper_instance = self.remapper_loader.get_remapper(backend.name)
+            if remapper_instance:
+                result = await self.remapper_loader.call_remap(remapper_instance, hook_context)
+                if result and result.status_code is not None:
+                    await websocket.close(code=1011, reason="Remapper closed connection")
+                    return
+                if result and result.backend and result.backend in self.backends:
+                    backend = self.backends[result.backend]
+                if result and result.path:
+                    full_path = result.path
+
+        lock_targets = backend.get_lock_targets(self.backends)
+
+        acquired = True
+        if self.lock_manager and lock_targets:
+            acquired = await self.lock_manager.acquire(backend.name, lock_targets)
+        if not acquired:
+            await websocket.close(code=1013, reason="Locked")
+            return
+
+        # === Clean activation using activated_backends component ===
+        if backend.name not in self.activated_backends:
+            self.activated_backends.add(backend.name)
+
+            if backend.script:
+                await self.hook_loader.call_hook(
+                    self.hook_loader.get_hook(backend.name), "on_backend_activated", hook_context
+                )
+            if self.lock_manager:
+                await self.lock_manager.acquire(backend.name, [backend.name])
+
+            # Stop backends this one locks (resource contention)
+            for locked_name in lock_targets:
+                locked_lifecycle = self.lifecycle_configs.get(locked_name)
+                if locked_lifecycle and locked_lifecycle.on_deactivate:
+                    logger.info(
+                        f"[{backend.name}] Stopping locked backend '{locked_name}' first "
+                        f"(to free resources before activating)"
+                    )
+                    await self.lifecycle_executor.execute(
+                        locked_name, locked_lifecycle.on_deactivate, is_activate=False
+                    )
+
+            # Activate self
+            lifecycle = self.lifecycle_configs.get(backend.name)
+            if lifecycle and lifecycle.on_activate:
+                await self.lifecycle_executor.execute(
+                    backend.name, lifecycle.on_activate, is_activate=True
+                )
+
+        # Increment in-flight count
+        self.active_counts[backend.name] = self.active_counts.get(backend.name, 0) + 1
+
+        try:
+            if backend.script:
+                await self.hook_loader.call_hook(
+                    self.hook_loader.get_hook(backend.name), "on_locks_acquired", hook_context
+                )
+                await self.hook_loader.call_hook(
+                    self.hook_loader.get_hook(backend.name), "on_before_request", hook_context
+                )
+
+            backend_url_str = str(backend.url).rstrip("/")
+            ws_url = ("wss://" if backend_url_str.startswith("https://") else "ws://") + \
+                     backend_url_str.split("://", 1)[-1] + full_path
+
+            # === PROPER REVERSE PROXY HEADER HANDLING ===
+            # Forward ALL headers except true hop-by-hop ones.
+            # This is the correct behavior for a reverse proxy (like nginx/traefik do).
+            HOP_BY_HOP = {
+                "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+                "te", "trailer", "transfer-encoding", "upgrade",
+                "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
+                "sec-websocket-accept", "sec-websocket-protocol"
+            }
+
+            filtered_headers = {
+                k: v for k, v in hook_context.request_headers.items()
+                if k.lower() not in HOP_BY_HOP
+            }
+
+            client_ip = websocket.client.host if websocket.client else "unknown"
+
+            # X-Forwarded headers
+            if "x-forwarded-for" in filtered_headers:
+                filtered_headers["x-forwarded-for"] += f", {client_ip}"
+            else:
+                filtered_headers["x-forwarded-for"] = client_ip
+
+            filtered_headers["x-forwarded-host"] = host or websocket.headers.get("host", "")
+            filtered_headers["x-real-ip"] = client_ip
+
+            proto = websocket.headers.get("x-forwarded-proto")
+            if not proto:
+                proto = "https" if websocket.url.scheme == "wss" else "http"
+            filtered_headers["x-forwarded-proto"] = proto
+
+            # === Force Origin (very important for Socket.IO) ===
+            # Always set Origin based on the Host the client actually used.
+            # This is more reliable than trusting whatever the browser sent.
+            origin_host = host or websocket.headers.get("host", "")
+            if origin_host:
+                scheme = "https" if proto == "https" or websocket.url.scheme == "wss" else "http"
+                filtered_headers["origin"] = f"{scheme}://{origin_host}"
+
+            # Also set Referer to match
+            if "referer" not in filtered_headers and "origin" in filtered_headers:
+                filtered_headers["referer"] = filtered_headers["origin"] + full_path
+
+            logger.info(f"Forwarding WebSocket {full_path} → {backend.name} ({ws_url})")
+            logger.debug(f"WebSocket headers being sent: { {k:v for k,v in filtered_headers.items() if k.lower() in ['origin','cookie','authorization','x-forwarded-proto','x-forwarded-host']} }")
+
+            backend_ws = await websockets.connect(
+                ws_url,
+                additional_headers=filtered_headers,
+                # Do not pass subprotocols here; let the backend negotiate or reject
+            )
+
+            await websocket.accept(
+                subprotocol=backend_ws.subprotocol if hasattr(backend_ws, "subprotocol") else None
+            )
+
+            async def client_to_backend():
+                try:
+                    while True:
+                        msg = await websocket.receive()
+                        if msg["type"] == "websocket.disconnect":
+                            break
+                        if "text" in msg:
+                            await backend_ws.send(msg["text"])
+                        elif "bytes" in msg:
+                            await backend_ws.send(msg["bytes"])
+                except Exception:
+                    pass
+                finally:
+                    if not backend_ws.closed:
+                        await backend_ws.close()
+
+            async def backend_to_client():
+                try:
+                    async for message in backend_ws:
+                        if isinstance(message, str):
+                            await websocket.send_text(message)
+                        else:
+                            await websocket.send_bytes(message)
+                except Exception:
+                    pass
+                finally:
+                    if websocket.client_state != WebSocketState.DISCONNECTED:
+                        try:
+                            await websocket.close()
+                        except Exception:
+                            pass
+
+            await asyncio.gather(client_to_backend(), backend_to_client(), return_exceptions=True)
+
+        except Exception as e:
+            logger.error(f"WebSocket proxy error for '{backend.name}' {full_path}: {e}")
+            if websocket.client_state == WebSocketState.CONNECTING:
+                await websocket.close(code=1011)
+        finally:
+            if backend.script:
+                await self.hook_loader.call_hook(
+                    self.hook_loader.get_hook(backend.name), "on_after_request", hook_context
+                )
+            if self.lock_manager and lock_targets:
+                await self.lock_manager.release(backend.name, lock_targets)
+            if backend.script:
+                await self.hook_loader.call_hook(
+                    self.hook_loader.get_hook(backend.name), "on_locks_released", hook_context
+                )
+
+            # Decrement in-flight count + release self-lock if last request
+            self.active_counts[backend.name] = max(0, self.active_counts.get(backend.name, 1) - 1)
+            if self.active_counts[backend.name] <= 0:
+                self.active_counts[backend.name] = 0
+                if self.lock_manager:
+                    await self.lock_manager.release(backend.name, [backend.name])
 
     async def _stream_sse(self, aiter_lines, backend_name: str = None):
         """Stream SSE, using remapper's stripper if available."""

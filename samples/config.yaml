@@ -43,7 +43,6 @@ backends:
         shell:
           - |
             echo "Example on_activate script too"
-            sleep 1
       on_deactivate:
         systemd:
           stop: [llama-server.service]

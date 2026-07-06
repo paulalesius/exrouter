@@ -61,8 +61,11 @@ class LifecycleExecutor:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-            if proc.returncode == 0:
-                logger.info(f"  ✓ {unit} {action} succeeded")
+            if proc.returncode == 0 or (action == "stop" and proc.returncode in (3, 4, 5)):
+                if proc.returncode == 0:
+                    logger.info(f"  ✓ {unit} {action} succeeded")
+                else:
+                    logger.info(f"  ✓ {unit} {action} succeeded (already stopped / not loaded)")
             else:
                 err = stderr.decode(errors="replace").strip()
                 logger.warning(f"  ⚠ {unit} {action} failed (rc={proc.returncode}): {err[:300]}")
