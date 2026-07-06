@@ -64,6 +64,8 @@ backends:
     lifecycle:
       on_activate: { systemd: { start: [stt-custom.service] }}
       on_deactivate: { systemd: { stop: [stt-custom.service]} }
+  # Don't forget env var CORS_ALLOW_ORIGIN=* for the service
+  # so its websocket endpoints allow exrouter
   open-webui:
     url: "http://127.0.0.1:9090"
     domain: ["openwebui.unnsvc.org"]

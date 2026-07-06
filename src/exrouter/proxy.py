@@ -410,7 +410,9 @@ class LockProxy:
 
             logger.info(f"Forwarding {request.method} {full_path} → {backend.name} ({backend.url})")
 
-            target_url = f"{str(backend.url).rstrip('/')}{full_path}"
+            # Include query string from original request
+            query_string = f"?{request.url.query}" if request.url.query else ""
+            target_url = f"{str(backend.url).rstrip('/')}{full_path}{query_string}"
 
             hop_by_hop = {"connection", "keep-alive", "transfer-encoding", "upgrade", "trailers"}
             filtered_headers = {
@@ -672,8 +674,11 @@ class LockProxy:
                 )
 
             backend_url_str = str(backend.url).rstrip("/")
+            
+            # Include query string from WebSocket URL
+            query_string = f"?{websocket.url.query}" if websocket.url.query else ""
             ws_url = ("wss://" if backend_url_str.startswith("https://") else "ws://") + \
-                     backend_url_str.split("://", 1)[-1] + full_path
+                     backend_url_str.split("://", 1)[-1] + full_path + query_string
 
             # === PROPER REVERSE PROXY HEADER HANDLING ===
             # Forward ALL headers except true hop-by-hop ones.
@@ -721,8 +726,15 @@ class LockProxy:
             logger.info(f"Forwarding WebSocket {full_path} → {backend.name} ({ws_url})")
             logger.debug(f"WebSocket headers being sent: { {k:v for k,v in filtered_headers.items() if k.lower() in ['origin','cookie','authorization','x-forwarded-proto','x-forwarded-host']} }")
 
+            # Socket.IO requires Host header to match the domain, not the backend IP
+            # websockets.connect() sets Host from URI, so we construct URI with correct hostname
+            ws_uri = ws_url
+            if origin_host:
+                # Replace IP with domain in URI
+                ws_uri = ws_url.replace("127.0.0.1:9090", origin_host)
+            
             backend_ws = await websockets.connect(
-                ws_url,
+                ws_uri,
                 additional_headers=filtered_headers,
                 # Do not pass subprotocols here; let the backend negotiate or reject
             )
