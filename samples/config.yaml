@@ -63,32 +63,32 @@ backends:
     paths: ["/transcribe"]
     locks: [llm]
     lifecycle:
-      on_activate: { systemd: { start: [stt-custom.target] }}
-      on_deactivate: { systemd: { stop: [stt-custom.target]} }
+      on_activate: { systemd: { start: [stt-custom.service] }}
+      on_deactivate: { systemd: { stop: [stt-custom.service]} }
   open-webui:
     url: "http://127.0.0.1:9090"
     domain: ["openwebui.unnsvc.org"]
     paths: ["/"]
     locks: [hermes-dashboard, hermes-webui]
     lifecycle:
-      on_activate: { systemd: { start: [open-webui.target] }
-      on_deactivate: { systemd: { stop: [open-webui.target]} }
+      on_activate: { systemd: { start: [open-webui.service] } }
+      on_deactivate: { systemd: { stop: [open-webui.service]} }
   hermes-dashboard:
     url: "http://127.0.0.1:9119"
     domain: ["dashboard.unnsvc.org"]
     paths: ["/"]
     locks: [open-webui, hermes-webui]
     lifecycle:
-      on_activate: { systemd: { start: [hermes-dashboard.target] }
-      on_deactivate: { systemd: { stop: [hermes-dashboard.target]} }
+      on_activate: { systemd: { start: [hermes-dashboard.service] } }
+      on_deactivate: { systemd: { stop: [hermes-dashboard.service]} }
   hermes-webui:
     url: "http://127.0.0.1:9100"
     domain: ["webui.unnsvc.org"]
     paths: ["/"]
     locks: [open-webui, hermes-dashboard]
     lifecycle:
-      on_activate: { systemd: { start: [hermes-webui.target] }
-      on_deactivate: { systemd: { stop: [hermes-webui.target]} }
+      on_activate: { systemd: { start: [hermes-webui.service] } }
+      on_deactivate: { systemd: { stop: [hermes-webui.service]} }
   langfuse:
     url: "http://127.0.0.1:7509"
     domain: ["langfuse.unnsvc.org"]

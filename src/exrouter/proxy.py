@@ -26,12 +26,12 @@ logger = logging.getLogger("exrouter")
 
 def strip_thinking_at_start(text: str) -> str:
     """Strip thinking blocks only at the START of text.
-    
+
     Handles both formats:
     - <think>...</think>
     - <think>...</think>
     - <reasoning>...</reasoning>
-    
+
     Only removes if the tag is at position 0 (after optional whitespace).
     """
     # Pattern matches opening tag at start, captures everything after closing tag
@@ -46,13 +46,13 @@ def strip_thinking_at_start(text: str) -> str:
         #  format (self-closing or paired tags)
         r'^\s*</?think\s*>(.*?)\s*</?think\s*>\s*(.*)',
     ]
-    
+
     for pattern in patterns:
         match = re.match(pattern, text, re.DOTALL | re.IGNORECASE)
         if match:
             # Return content after the closing tag
             return match.group(2).strip()
-    
+
     # No thinking tag at start, return as-is
     return text
 
@@ -92,6 +92,7 @@ class LockManager:
     def __init__(self, backends: dict[str, Backend], timeout: int = 300):
         self.backends = backends
         self.locks: dict[str, LockState] = {}
+        self.holder_counts: dict[str, int] = {}  # target -> number of in-flight holders from locked_by
         self.condition = asyncio.Condition()
         self.timeout = timeout
 
@@ -106,7 +107,12 @@ class LockManager:
                 return False
 
             for target in lock_targets:
-                self.locks[target] = LockState(locked_by=backend_name)
+                if target not in self.locks:
+                    self.locks[target] = LockState(locked_by=backend_name)
+                    self.holder_counts[target] = 1
+                else:
+                    # Re-acquire by same backend (concurrent requests) — just increment holder count
+                    self.holder_counts[target] += 1
             return True
 
     async def _wait_until_free(self, backend_name: str, lock_targets: list[str]) -> None:
@@ -120,7 +126,10 @@ class LockManager:
         async with self.condition:
             for target in lock_targets:
                 if target in self.locks and self.locks[target].locked_by == backend_name:
-                    del self.locks[target]
+                    self.holder_counts[target] -= 1
+                    if self.holder_counts[target] <= 0:
+                        del self.locks[target]
+                        del self.holder_counts[target]
             self.condition.notify_all()
 
     def is_locked(self, backend_name: str) -> bool:
@@ -201,7 +210,7 @@ class LockProxy:
 
     def _find_backend(self, request: Request, path: str) -> Optional[Backend]:
         """Select backend using combined domain + path matching.
-        
+
         Rules (as requested):
         - If the incoming request's Host header matches ANY backend's declared `domain`,
           then ONLY backends that declare a matching domain are eligible.
@@ -211,12 +220,12 @@ class LockProxy:
           (original behavior for stt_custom, llm, etc.).
         """
         host = request.headers.get("host", "")
-        
+
         # Step 1: Does this request's Host match any backend that declares domains?
         request_matches_some_domain = any(
             b.domain and b.matches_domain(host) for b in self.backends.values()
         )
-        
+
         for b in self.backends.values():
             domain_ok = True
             if b.domain:
@@ -227,7 +236,7 @@ class LockProxy:
                 if request_matches_some_domain:
                     # A domain was specified in the request → skip pure path backends
                     domain_ok = False
-            
+
             path_ok = b.matches_path(path)
             if domain_ok and path_ok:
                 return b
@@ -333,6 +342,13 @@ class LockProxy:
                     "on_backend_activated",
                     hook_context
                 )
+
+            # Mark this backend as busy in the lock manager (self-lock).
+            # This ensures that any other backend that declares this one in its `locks:`
+            # list will properly wait in acquire() until we go idle.
+            # Without this, a contender could start while we still have in-flight requests.
+            if self.lock_manager:
+                await self.lock_manager.acquire(backend.name, [backend.name])
 
             # === IMPORTANT ORDERING FOR RESOURCE CONTENTION ===
             # When activating a backend that locks other backends, we MUST:
@@ -540,6 +556,10 @@ class LockProxy:
             self.active_counts[backend.name] = self.active_counts.get(backend.name, 1) - 1
             if self.active_counts[backend.name] <= 0:
                 self.active_counts[backend.name] = 0
+                if self.lock_manager:
+                    # Release our self-lock so that any backend locking us can now acquire
+                    await self.lock_manager.release(backend.name, [backend.name])
+
                 if backend.script:
                     await self.hook_loader.call_hook(
                         self.hook_loader.get_hook(backend.name),
@@ -562,12 +582,12 @@ class LockProxy:
                         )
 
                 # Note: We intentionally do NOT auto-trigger on_activate for the previously
-                # locked backends here. 
-                # 
+                # locked backends here.
+                #
                 # Reason: On quick failures (connection error, timeout, etc.) this would
                 # immediately restart the previously stopped service (as you saw with llama-server
-                # coming back after the failed /transcribe). 
-                # 
+                # coming back after the failed /transcribe).
+                #
                 # The critical & safe behavior is only the other direction:
                 #   "When I activate and I lock something → first stop the locked ones"
                 # This prevents resource contention and matches the spirit of your original hook.py.
@@ -621,12 +641,12 @@ class LockProxy:
             remapper = self.remapper_loader.get_remapper(backend_name)
             if remapper and hasattr(remapper, 'get_streaming_stripper'):
                 stripper = remapper.get_streaming_stripper()
-        
+
         buffer = ""
         async for chunk in aiter_bytes:
             chunk_str = chunk.decode('utf-8', errors='replace')
             buffer += chunk_str
-            
+
             # Try to parse as JSON and strip thinking tags
             try:
                 data = json.loads(buffer)
@@ -642,7 +662,7 @@ class LockProxy:
             except json.JSONDecodeError:
                 # Not complete JSON yet, continue buffering
                 pass
-            
+
             # Apply streaming stripper if available
             if stripper:
                 stripped = stripper.process_chunk(buffer)
