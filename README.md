@@ -1,4 +1,4 @@
-# EXRouter - Exclusive Router
+# EXRouter - Exclusive Router v1.1.0
 
 A declarative backend proxy with **global locking for VRAM/resource-aware scheduling** and request remapping. Routes requests to configured backends and manages cross-backend exclusive locks to enable efficient hardware utilization.
 
@@ -26,6 +26,9 @@ It supports advanced routing needs through **request remapping** and **domain-ba
 - **Hop-by-Hop Header Filtering**: Proper HTTP proxy behavior
 - **Lifecycle Management**: Declarative `lifecycle:` blocks to manage a backend's own service (systemd, shell, wait_for). Automatically stops conflicting locked backends on activation. Backends with `locks:` stay running until another conflicting backend activates. Can be combined with custom Python hooks.
 - **Domain-based Routing & Virtual Hosting**: Optional `domain:` field (supports wildcards). EXRouter can now function as a lightweight reverse proxy / virtual host router without needing Caddy, Nginx or Traefik in front. When a request's `Host` header matches any declared domain, only domain-declaring backends are considered. Multiple backends can share the same domain but serve different paths. Pure path-based backends are automatically skipped in domain-matched requests. Proper `X-Forwarded-*` headers and compression handling are included.
+- **WebSocket Proxy Support**: Automatic WebSocket upgrade handling with proper header forwarding
+- **Health & Config Endpoints**: Built-in `/health` and `/config` endpoints for monitoring
+- **Environment Configuration**: Server bind address configurable via `EXROUTER_HOST` and `EXROUTER_PORT`
 - **Error Propagation**: Backend HTTP status codes are forwarded correctly
 
 ## Architecture
@@ -58,12 +61,18 @@ cd /src/exrouter
 uv sync
 
 # Edit config.yaml or use your own
-uv run python -m src.exrouter.main -c /path/to/config.yaml
+uv run python -m exrouter.main -c /path/to/config.yaml
 ```
 
 ## Configuration
 
-All configuration is done through YAML:
+All configuration is done through YAML.
+
+**Important terminology distinction:**
+- **Lock domain**: A group of backends that can lock each other (YAML hierarchy level)
+- **Routing domain**: A `Host` header pattern a backend handles (the `domain:` field in backend config)
+
+### Config Structure
 
 ```yaml
 server:
@@ -74,83 +83,118 @@ global_lock:
   enabled: true
   timeout: 300
 
+# Top-level "backends" key contains LOCK DOMAINS
+# Each lock domain contains backends that can lock each other
 backends:
-  llm:
-    url: http://127.0.0.1:8080
-    paths:
-      - /v1/chat/completions
-      - /v1/completions
-      - /v1/models
-    locks:
-      - embed
-
-  embed:
-    url: http://127.0.0.1:8081
-    paths:
-      - /v1/embeddings
-      - /v1/embed
-      - /v1/info
-    remapper: /path/to/tei_remapper.py
-    locks: []
+  compute:  # ← LOCK DOMAIN name
+    llm:    # ← backend name (directly under lock domain)
+      url: http://127.0.0.1:8080
+      paths:
+        - /v1/chat/completions
+        - /v1/completions
+        - /v1/models
+      locks:
+        - embed  # locks other backends in SAME lock domain
+    
+    embed:   # ← another backend in same lock domain
+      url: http://127.0.0.1:8081
+      paths:
+        - /v1/embeddings
+        - /v1/embed
+        - /v1/info
+      remapper: /path/to/tei_remapper.py
+      locks: []
 ```
 
 ### Backend Configuration
 
 Each backend specifies:
 
-- `url`: Backend server URL
+- `url`: Backend server URL (must be http/https)
 - `paths`: List of path patterns (supports wildcards like `/v1/vision/*`)
-- `locks`: List of other backend names to **exclusively lock** while processing this backend's requests. This is the mechanism for declaring VRAM/resource contention between backends.
+- `locks`: List of other backend names to **exclusively lock** while processing. Must be in the same lock domain. This is the mechanism for declaring VRAM/resource contention.
 - `script` (optional): Path to Python hook script for lifecycle callbacks (e.g. dynamic model load/unload)
 - `remapper` (optional): Path to Python request remapper script
 - `domain` (optional): List of domain / `Host` header patterns this backend handles (supports `fnmatch` wildcards like `*.example.com` or exact names). When present, **both** domain and path must match. If the incoming request's `Host` matches any backend's declared domain, only domain-declaring backends are eligible — pure path-based backends are skipped. This turns EXRouter into a capable reverse proxy / virtual host router.
+- `lifecycle` (optional): Declarative lifecycle actions (systemd + shell + wait_for) on activate/deactivate
+
+### Lock Domains
+
+Backends are organized into **lock domains** (the first-level keys under `backends:`). Each lock domain is an independent group where backends can lock each other:
+
+```yaml
+backends:
+  compute:  # Lock domain 1 - GPU compute backends
+    llm:
+      url: http://localhost:8080
+      locks: [embed]
+    embed:
+      url: http://localhost:8081
+      locks: []
+  
+  audio:  # Lock domain 2 - Audio processing backends
+    stt:
+      url: http://localhost:7301
+      locks: [tts]
+    tts:
+      url: http://localhost:7302
+      locks: []
+```
+
+Backends in `compute` lock domain can only lock other backends in `compute`. Backends in `audio` can only lock backends in `audio`. Cross-domain locks are not allowed.
 
 ### Domain-based Routing & Virtual Hosting
 
-EXRouter now supports **domain-based backend matching**, allowing you to run multiple services on different subdomains (or the same domain with different paths) through a single EXRouter instance — without needing an extra reverse proxy (Caddy/Nginx/Traefik) in front.
+EXRouter supports **routing domains** via the `domain:` field in backend config. This allows you to run multiple services on different subdomains through a single EXRouter instance — without needing an extra reverse proxy (Caddy/Nginx/Traefik) in front.
 
 **How it works:**
-- Add `domain:` to a backend (string or list).
-- A request is routed to a backend only if **both** the `Host` header matches one of its domains **and** the path matches one of its `paths`.
-- If the request's `Host` matches any declared domain in the config, pure path-only backends (e.g. `stt_custom`) are automatically ignored.
-- Multiple backends can share the same domain but use different path patterns.
-- Use `paths: ["*"]` (recommended) or `paths: ["/"]` for backends that should own the entire domain/subdomain.
+- Add `domain:` to a backend (string or list of domain patterns)
+- A request is routed to a backend only if **both** the `Host` header matches one of its domains **and** the path matches one of its `paths`
+- If the request's `Host` matches any declared domain in the config, pure path-only backends (backends without `domain:` set) are automatically ignored
+- Multiple backends can share the same domain but use different path patterns
+- Use `paths: ["*"]` (recommended) or `paths: ["/"]` for backends that should own the entire domain/subdomain
 
 **Example config with virtual hosting:**
 
 ```yaml
 backends:
-  langfuse:
-    url: http://127.0.0.1:7509
-    domain: ["langfuse.unnsvc.org"]
-    paths: ["*"]                    # or ["/"]
-
-  open-webui:
-    url: http://127.0.0.1:9090
-    domain: ["openwebui.unnsvc.org"]
-    paths: ["*"]
-
-  hermes-dashboard:
-    url: http://127.0.0.1:9119
-    domain: ["dashboard.unnsvc.org"]
-    paths: ["*"]
-
-  # Traditional path-based backend (no domain) still works
-  stt_custom:
-    url: http://127.0.0.1:7301
-    paths: ["/transcribe"]
-    locks: [llm]
-    lifecycle:
-      on_activate:
-        systemd:
-          start: [stt-custom.target]
+  frontend:  # Lock domain for frontend services
+    open-webui:
+      url: http://127.0.0.1:9090
+      domain: ["openwebui.unnsvc.org"]
+      paths: ["*"]  # Owns entire domain
+    
+    hermes-dashboard:
+      url: http://127.0.0.1:9119
+      domain: ["dashboard.unnsvc.org"]
+      paths: ["*"]
+    
+    langfuse:
+      url: http://127.0.0.1:7509
+      domain: ["langfuse.unnsvc.org"]
+      paths: ["*"]
+  
+  compute:  # Lock domain for GPU backends (no routing domain = path-only)
+    llm:
+      url: http://127.0.0.1:8080
+      paths:
+        - /v1/chat/completions
+        - /v1/completions
+      locks: [embed]
+    
+    embed:
+      url: http://127.0.0.1:8081
+      paths:
+        - /v1/embeddings
+      locks: []
 ```
 
 With this setup you can access:
-- `https://langfuse.unnsvc.org/` → Langfuse
-- `https://openwebui.unnsvc.org/` → Open WebUI
-- `https://dashboard.unnsvc.org/` → Hermes Dashboard
-- Direct `/transcribe` calls (via IP or non-matching host) → stt_custom
+- `https://openwebui.unnsvc.org/` → open-webui (domain match)
+- `https://dashboard.unnsvc.org/` → hermes-dashboard (domain match)
+- `https://langfuse.unnsvc.org/` → langfuse (domain match)
+- `http://127.0.0.1:4001/v1/chat/completions` → llm (path-only, no domain match)
+- `http://127.0.0.1:4001/v1/embeddings` → embed (path-only, no domain match)
 
 EXRouter also sets proper reverse proxy headers (`X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-IP`) and handles compression transparently.
 
@@ -161,22 +205,24 @@ EXRouter supports declarative lifecycle management via the `lifecycle:` key unde
 Example:
 
 ```yaml
-llm:
-  url: http://127.0.0.1:8080
-  paths: [/v1/chat/completions]
-  locks: [stt_custom]
-  lifecycle:
-    on_activate:
-      systemd:
-        start: [llama-server.service]
-      wait_for:
-        - type: port
-          host: 127.0.0.1
-          port: 8080
-          timeout: 30
-    on_deactivate:
-      systemd:
-        stop: [llama-server.service]
+backends:
+  compute:
+    llm:
+      url: http://127.0.0.1:8080
+      paths: [/v1/chat/completions]
+      locks: [stt]
+      lifecycle:
+        on_activate:
+          systemd:
+            start: [llama-server.service]
+          wait_for:
+            - type: port
+              host: 127.0.0.1
+              port: 8080
+              timeout: 30
+        on_deactivate:
+          systemd:
+            stop: [llama-server.service]
 ```
 
 **Important rules and behavior:**
@@ -251,6 +297,18 @@ class BackendHook:
 - `enabled`: Whether locking is active
 - `timeout`: Seconds to wait for locks (returns 503 if exceeded)
 
+### Environment Variables
+
+Server configuration can be overridden via environment variables:
+
+- `EXROUTER_HOST`: Host to bind to (default: `0.0.0.0`)
+- `EXROUTER_PORT`: Port to listen on (default: `4001`)
+
+Example:
+```bash
+EXROUTER_HOST=127.0.0.1 EXROUTER_PORT=8080 uv run python -m exrouter.main
+```
+
 ## How Locking Works
 
 **Global locking is one of EXRouter's primary innovations.** It turns limited VRAM (and similar hardware resources) into a first-class, declaratively managed concern rather than an afterthought.
@@ -283,7 +341,16 @@ The result: predictable, efficient VRAM sharing without complex custom orchestra
 
 - **SSE (Server-Sent Events)**: Streamed line-by-line
 - **Regular responses**: Streamed byte-by-byte
+- **WebSocket**: Automatically upgraded and proxied with proper headers
 - Backend HTTP status codes (including 4xx and 5xx) are forwarded correctly
+
+## Endpoints
+
+EXRouter exposes the following built-in endpoints:
+
+- `/health`: Health check endpoint (returns 200 OK if server is running)
+- `/config`: Returns current configuration as JSON (useful for debugging and monitoring)
+- All other paths are routed to configured backends
 
 ## Testing
 
@@ -304,7 +371,7 @@ After=network.target
 Type=simple
 User=noname
 WorkingDirectory=/src/exrouter
-ExecStart=/src/exrouter/.venv/bin/python -m src.exrouter.main -c /src/exrouter/config.yaml
+ExecStart=/src/exrouter/.venv/bin/python -m exrouter.main -c /src/exrouter/config.yaml
 Restart=always
 
 [Install]

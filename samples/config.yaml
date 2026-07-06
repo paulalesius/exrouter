@@ -30,7 +30,7 @@ backends:
         - "/v1/tokenize"
         - "/v1/detokenize"
       #script: "/src/exrouter/samples/hook.py"
-      remapper: "/src/exrouter/samples/llm-think-strip-remapper.py"
+      #remapper: "/src/exrouter/samples/llm-think-strip-remapper.py"
       locks: [stt_custom]
       lifecycle:
         on_activate:
@@ -59,8 +59,8 @@ backends:
       paths: ["/transcribe"]
       locks: [llm]
       lifecycle:
-        on_activate: { systemd: { start: [stt-custom.service] }}
-        on_deactivate: { systemd: { stop: [stt-custom.service]} }
+        on_activate: { systemd: { start: [stt-custom.target] }}
+        on_deactivate: { systemd: { stop: [stt-custom.target]} }
 
     # Demonstration of a llama-server, the paths are TEI paths, but
     # we use a remapper to remap to llama-server paths

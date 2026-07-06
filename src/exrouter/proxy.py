@@ -195,9 +195,18 @@ class LockProxy:
             await self._handle_websocket(websocket, path)
 
     def _find_backend(self, host: str, path: str) -> Optional[Backend]:
-        """Robust domain + path matching.
+        """Domain-aware routing.
         
-        Searches all backends across all domains. Returns the first match.
+        1. Extract domain from host (remove port)
+        2. Filter backends by domain match:
+           - If host matches a domain pattern: only match backends with that domain
+           - If host matches no domain: only match backends with empty domain list
+        3. Then match by path
+        4. Return first match
+        
+        Example:
+        - Request to openwebui.unnsvc.org → only open-webui matches (domain: ["openwebui.unnsvc.org"])
+        - Request to 127.0.0.1:4001/v1/tokenize → only llm matches (domain: [])
         """
         import fnmatch
 
@@ -205,9 +214,25 @@ class LockProxy:
         host_no_port = raw_host.lower().split(":")[0]
         full_path = f"/{path}" if not path.startswith("/") else path
 
-        domain_matched = []
-        path_only = []
+        # Step 1: Find which domain pattern (if any) the host matches
+        matched_domain_pattern: Optional[str] = None
+        for backend in self.backends.values():
+            domains = backend.domain
+            if isinstance(domains, str):
+                domains = [domains]
+            if not domains:
+                continue
 
+            for d in domains:
+                d_clean = str(d).lower().split(":")[0]
+                if fnmatch.fnmatch(host_no_port, d_clean):
+                    matched_domain_pattern = d_clean
+                    break
+            if matched_domain_pattern:
+                break
+
+        # Step 2: Filter backends by domain
+        candidates: list[Backend] = []
         for backend in self.backends.values():
             domains = backend.domain
             if isinstance(domains, str):
@@ -215,19 +240,19 @@ class LockProxy:
             if not domains:
                 domains = []
 
-            matched_domain = False
-            for d in domains:
-                d_clean = str(d).lower().split(":")[0]
-                if fnmatch.fnmatch(host_no_port, d_clean):
-                    domain_matched.append(backend)
-                    matched_domain = True
-                    break
+            if matched_domain_pattern is not None:
+                # Host matched a domain → only match backends with that domain
+                for d in domains:
+                    d_clean = str(d).lower().split(":")[0]
+                    if fnmatch.fnmatch(host_no_port, d_clean):
+                        candidates.append(backend)
+                        break
+            else:
+                # Host matched no domain → only match backends with empty domain list
+                if not domains:
+                    candidates.append(backend)
 
-            if not matched_domain:
-                path_only.append(backend)
-
-        candidates = domain_matched if domain_matched else path_only
-
+        # Step 3: Match by path within filtered candidates
         for backend in candidates:
             if backend.matches_path(full_path):
                 return backend
