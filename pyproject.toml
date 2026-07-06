@@ -10,6 +10,8 @@ dependencies = [
     "httpx>=0.26.0",
     "pyyaml>=6.0.0",
     "pydantic>=2.5.0",
+    "websockets>=12.0",
+    "click>=8.1.0",
 #    "pyannote-audio",
 ]
 
