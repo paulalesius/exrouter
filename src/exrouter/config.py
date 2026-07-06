@@ -1,5 +1,6 @@
 """Configuration loading from YAML with Pydantic validation."""
 
+import logging
 from pydantic import BaseModel, Field, AnyHttpUrl, field_validator, model_validator, ConfigDict
 from typing import Any, Literal, Optional
 import yaml
@@ -116,9 +117,37 @@ class GlobalLockConfig(BaseModel):
 
 
 class ServerConfig(BaseModel):
-    """Server configuration."""
+    """Server configuration.
+    
+    Configured via environment variables: EXROUTER_HOST, EXROUTER_PORT
+    
+    Defaults: host=0.0.0.0, port=4001
+    """
+    model_config = ConfigDict(extra="allow")
+    
     host: str = Field(default="0.0.0.0", description="Host to bind to")
     port: int = Field(default=4001, ge=1, le=65535, description="Port to listen on")
+    
+    @classmethod
+    def from_env(cls) -> "ServerConfig":
+        """Create ServerConfig from environment variables.
+        
+        Reads EXROUTER_HOST and EXROUTER_PORT if set.
+        Falls back to defaults if not set.
+        """
+        import os
+        
+        host = os.environ.get("EXROUTER_HOST", "0.0.0.0")
+        port_str = os.environ.get("EXROUTER_PORT", "4001")
+        
+        try:
+            port = int(port_str)
+        except ValueError:
+            logger = logging.getLogger("exrouter")
+            logger.warning(f"Invalid EXROUTER_PORT '{port_str}', using default 4001")
+            port = 4001
+        
+        return cls(host=host, port=port)
 
 
 class Config(BaseModel):

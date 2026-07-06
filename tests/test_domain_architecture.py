@@ -15,10 +15,6 @@ from exrouter.proxy import LockProxy
 def test_domain_parsing():
     """Test that domains are correctly parsed from YAML config."""
     config_yaml = """
-server:
-  host: 0.0.0.0
-  port: 4001
-
 backends:
   compute:
     llm:
@@ -54,10 +50,6 @@ global_lock:
 def test_backend_domain_assignment():
     """Test that Backends get correct domain_name from LockProxy."""
     config_yaml = """
-server:
-  host: 0.0.0.0
-  port: 4001
-
 backends:
   compute:
     llm:
@@ -88,10 +80,6 @@ global_lock:
 def test_lock_targets_within_domain():
     """Test that get_lock_targets only returns backends in same domain."""
     config_yaml = """
-server:
-  host: 0.0.0.0
-  port: 4001
-
 backends:
   compute:
     llm:
@@ -132,10 +120,6 @@ global_lock:
 def test_cross_domain_lock_validation():
     """Test that cross-domain locks are caught during validation."""
     config_yaml = """
-server:
-  host: 0.0.0.0
-  port: 4001
-
 backends:
   compute:
     llm:
@@ -162,10 +146,6 @@ global_lock:
 def test_missing_lock_target_validation():
     """Test that missing lock targets are caught during validation."""
     config_yaml = """
-server:
-  host: 0.0.0.0
-  port: 4001
-
 backends:
   compute:
     llm:
@@ -185,10 +165,6 @@ global_lock:
 def test_multiple_domains_isolation():
     """Test that multiple domains have separate LockManagers."""
     config_yaml = """
-server:
-  host: 0.0.0.0
-  port: 4001
-
 backends:
   compute:
     llm:
@@ -231,10 +207,6 @@ global_lock:
 def test_config_endpoint():
     """Test that /config endpoint returns full config as JSON."""
     config_yaml = """
-server:
-  host: 0.0.0.0
-  port: 4001
-
 backends:
   compute:
     llm:
