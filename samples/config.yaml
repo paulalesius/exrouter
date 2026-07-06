@@ -1,14 +1,8 @@
-server:
-  host: 0.0.0.0
-  # For testing, set PORT on the EXRouter service
-  port: 4002
-
 global_lock:
   enabled: true
   timeout: 300
 
 backends:
-
   compute:
     llm:
       url: "http://127.0.0.1:8080"

@@ -84,6 +84,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
 ]
 
 [package.optional-dependencies]
@@ -103,6 +104,7 @@ requires-dist = [
     { name = "pytest-httpx", marker = "extra == 'test'", specifier = ">=0.30.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.27.0" },
+    { name = "websockets", specifier = ">=12.0" },
 ]
 provides-extras = ["test"]
 
