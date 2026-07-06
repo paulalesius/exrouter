@@ -1,4 +1,10 @@
-"""EXRouter - routes requests to backends with global locking and optional request remapping."""
+"""EXRouter - routes requests to backends with global locking and optional request remapping.
+
+Architecture:
+- LockDomain: Top-level domain containing backends (e.g. "compute", "frontend")
+- Backend: Individual backend within a domain, can only lock other backends in same domain
+- LockProxy: Main proxy that routes requests and manages multiple domains
+"""
 
 import asyncio
 import json
@@ -6,12 +12,10 @@ import logging
 import time
 import re
 from urllib.parse import urlparse
+from typing import Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatusCode
-
-from dataclasses import dataclass
-from typing import Optional
 
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
@@ -22,6 +26,7 @@ from starlette.websockets import WebSocketState
 
 from .backend import Backend
 from .config import Config, LifecycleConfig
+from .domain import LockDomain
 from .hooks import HookLoader, HookContext
 from .lifecycle import LifecycleExecutor
 from .remapper import RemapperLoader, RemapResult
@@ -39,26 +44,18 @@ def strip_thinking_at_start(text: str) -> str:
     
     Only removes if the tag is at position 0 (after optional whitespace).
     """
-    # Pattern matches opening tag at start, captures everything after closing tag
-    # Note: No \s* required AFTER opening tag (e.g.,  not  )
     patterns = [
-        #  format (closing tag is )
         r'^\s*<think>(.*?)\s*</think>\s*(.*)',
-        #  format  (closing tag is </reasoning>)
         r'^\s*<think\b[^>]*>(.*?)\s*</think>\s*(.*)',
-        #  format
         r'^\s*<reasoning\b[^>]*>(.*?)\s*</reasoning>\s*(.*)',
-        #  format (self-closing or paired tags)
         r'^\s*</?think\s*>(.*?)\s*</?think\s*>\s*(.*)',
     ]
     
     for pattern in patterns:
         match = re.match(pattern, text, re.DOTALL | re.IGNORECASE)
         if match:
-            # Return content after the closing tag
             return match.group(2).strip()
     
-    # No thinking tag at start, return as-is
     return text
 
 
@@ -85,86 +82,58 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         return response
 
 
-@dataclass
-class LockState:
-    """Track which backend holds a lock."""
-    locked_by: str
-
-
-class LockManager:
-    """Manages global locks across backends using Condition for proper waiting."""
-
-    def __init__(self, backends: dict[str, Backend], timeout: int = 300):
-        self.backends = backends
-        self.locks: dict[str, LockState] = {}
-        self.holder_counts: dict[str, int] = {}  # target -> number of in-flight holders from locked_by
-        self.condition = asyncio.Condition()
-        self.timeout = timeout
-
-    async def acquire(self, backend_name: str, lock_targets: list[str]) -> bool:
-        async with self.condition:
-            try:
-                await asyncio.wait_for(
-                    self._wait_until_free(backend_name, lock_targets),
-                    timeout=self.timeout
-                )
-            except asyncio.TimeoutError:
-                return False
-
-            for target in lock_targets:
-                if target not in self.locks:
-                    self.locks[target] = LockState(locked_by=backend_name)
-                    self.holder_counts[target] = 1
-                else:
-                    # Re-acquire by same backend (concurrent requests) — just increment holder count
-                    self.holder_counts[target] += 1
-            return True
-
-    async def _wait_until_free(self, backend_name: str, lock_targets: list[str]) -> None:
-        while any(
-            target in self.locks and self.locks[target].locked_by != backend_name
-            for target in lock_targets
-        ):
-            await self.condition.wait()
-
-    async def release(self, backend_name: str, lock_targets: list[str]) -> None:
-        async with self.condition:
-            for target in lock_targets:
-                if target in self.locks and self.locks[target].locked_by == backend_name:
-                    self.holder_counts[target] -= 1
-                    if self.holder_counts[target] <= 0:
-                        del self.locks[target]
-                        del self.holder_counts[target]
-            self.condition.notify_all()
-
-    def is_locked(self, backend_name: str) -> bool:
-        return backend_name in self.locks
-
-
 class LockProxy:
-    """Main proxy server with connection pooling, locking, hooks, and request remapping."""
+    """Main proxy server with connection pooling, locking, hooks, and request remapping.
+    
+    Architecture:
+    - Multiple LockDomains, each with its own LockManager
+    - Backends can only lock other backends in the same domain
+    - Cross-domain requests don't cause deadlocks
+    """
 
     def __init__(self, config: Config):
         self.config = config
 
-        # Convert backend configs to Backend instances
+        # Build hierarchical domain structure
+        # domains: domain_name -> LockDomain
+        self.domains: dict[str, LockDomain] = {}
+        
+        # Flat lookup for routing: backend_name -> Backend
+        # (backend names must be globally unique across all domains)
         self.backends: dict[str, Backend] = {}
-        for name, backend_config in config.backends.items():
-            self.backends[name] = Backend(
-                name=name,
-                url=str(backend_config.url),
-                paths=backend_config.paths,
-                locks=backend_config.locks,
-                domain=backend_config.domain,
-                script=backend_config.script,
-                remapper=backend_config.remapper,
-            )
+        
+        # Track which domain each backend belongs to
+        self.backend_to_domain: dict[str, str] = {}
+        
+        # Lifecycle configs per backend
+        self.lifecycle_configs: dict[str, Optional[LifecycleConfig]] = {}
 
-        # Initialize lock manager
-        self.lock_manager = LockManager(
-            self.backends,
-            timeout=config.global_lock.timeout
-        ) if config.global_lock.enabled else None
+        for domain_name, domain_config in config.backends.items():
+            # Build Backend instances for this domain
+            domain_backends: dict[str, Backend] = {}
+            
+            for backend_name, backend_config in domain_config.backends.items():
+                backend = Backend(
+                    name=backend_name,
+                    domain_name=domain_name,  # ← track domain membership
+                    url=str(backend_config.url),
+                    paths=backend_config.paths,
+                    locks=backend_config.locks,
+                    domain=backend_config.domain,
+                    script=backend_config.script,
+                    remapper=backend_config.remapper,
+                )
+                domain_backends[backend_name] = backend
+                self.backends[backend_name] = backend
+                self.backend_to_domain[backend_name] = domain_name
+                self.lifecycle_configs[backend_name] = backend_config.lifecycle
+            
+            # Create LockDomain with its own LockManager
+            self.domains[domain_name] = LockDomain(
+                name=domain_name,
+                backends=domain_backends,
+                timeout=config.global_lock.timeout
+            )
 
         # Initialize hook loader
         self.hook_loader = HookLoader()
@@ -172,26 +141,19 @@ class LockProxy:
             if backend.script:
                 self.hook_loader.load_script(backend.name, backend.script)
 
-        # NEW: Initialize remapper loader
+        # Initialize remapper loader
         self.remapper_loader = RemapperLoader()
         for backend in self.backends.values():
             if backend.remapper:
                 self.remapper_loader.load_script(backend.name, backend.remapper)
 
-        # Initialize declarative lifecycle executor (systemd/shell/wait)
+        # Initialize declarative lifecycle executor
         self.lifecycle_executor = LifecycleExecutor()
-        self.lifecycle_configs: dict[str, Optional[LifecycleConfig]] = {}
-        for name, backend_config in config.backends.items():
-            self.lifecycle_configs[name] = backend_config.lifecycle
 
         # Track in-flight requests per backend
         self.active_counts: dict[str, int] = {name: 0 for name in self.backends}
 
-        # Clean activation tracking (proper components)
-        # - active_counts: tracks in-flight requests (used only for LockManager self-locks)
-        # - activated_backends: backends that have run their on_activate lifecycle.
-        #   They stay activated until another backend that locks them forces deactivation.
-        #   This prevents repeated lifecycle spam on chatty frontends like Open WebUI.
+        # Clean activation tracking
         self.activated_backends: set[str] = set()
 
         # Shared httpx client
@@ -206,15 +168,18 @@ class LockProxy:
         self._setup_routes()
 
     def _setup_routes(self) -> None:
-        # Note: We deliberately do NOT register a literal "/" route here.
-        # The catch-all "/{path:path}" below handles root requests so that
-        # domain-based backends with paths: ["/"] or paths: ["*"] can serve
-        # the homepage and all sub-paths of their domain.
-        # /health remains internal to EXRouter for monitoring.
-
         @self.app.get("/health")
         async def health():
             return {"status": "healthy"}
+
+        @self.app.get("/config")
+        async def get_config() -> dict:
+            """Return full configuration as JSON.
+            
+            This endpoint exposes the complete config in JSON format,
+            useful for debugging and monitoring.
+            """
+            return self.config.model_dump()
 
         @self.app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
         async def proxy_request(request: Request, path: str):
@@ -226,8 +191,8 @@ class LockProxy:
 
     def _find_backend(self, host: str, path: str) -> Optional[Backend]:
         """Robust domain + path matching.
-
-        Uses Backend.matches_path() so that paths: ["/"] correctly matches everything.
+        
+        Searches all backends across all domains. Returns the first match.
         """
         import fnmatch
 
@@ -259,7 +224,7 @@ class LockProxy:
         candidates = domain_matched if domain_matched else path_only
 
         for backend in candidates:
-            if backend.matches_path(full_path):   # ← Use the proper method
+            if backend.matches_path(full_path):
                 return backend
 
         logger.warning(
@@ -271,23 +236,17 @@ class LockProxy:
         full_path = f"/{path}"
         start_time = time.time()
 
-        # 1. Find matching backend by domain (if declared) + path.
-        #    - If backend declares `domain:`, the Host header must match one of its patterns
-        #      AND the path must match one of its path patterns.
-        #    - If backend has no `domain:` (empty), only path matching is required (legacy behavior).
-        #    This design allows multiple backends to share the same domain name but serve
-        #    different paths (e.g. api.example.com/v1/chat vs api.example.com/v1/embed).
+        # 1. Find matching backend by domain + path
         host = request.headers.get("host", "")
         backend: Optional[Backend] = self._find_backend(host, full_path)
 
         if not backend:
             logger.warning(
-                f"No backend matched host+path for Host={request.headers.get('host', '-')} path={full_path} "
-                f"→ returning 404 from EXRouter"
+                f"No backend matched host+path for Host={request.headers.get('host', '-')} path={full_path}"
             )
             return Response(status_code=404, content=f"Unknown path: {full_path}")
 
-        # 2. NEW: Run request remapper (if configured) BEFORE acquiring locks
+        # 2. Run request remapper (if configured) BEFORE acquiring locks
         request_body = await request.body()
         hook_context = HookContext(
             backend_name=backend.name,
@@ -306,7 +265,7 @@ class LockProxy:
                 )
                 if result:
                     remapped = True
-                    # Short-circuit with a direct response?
+                    
                     if result.status_code is not None:
                         content = result.content
                         if isinstance(content, str):
@@ -317,21 +276,15 @@ class LockProxy:
                             headers=result.response_headers or {}
                         )
 
-                    # Switch backend?
                     if result.backend and result.backend in self.backends:
                         backend = self.backends[result.backend]
-                        hook_context.backend_name = backend.name  # update context
+                        hook_context.backend_name = backend.name
                         logger.info(f"Remapped request to backend '{backend.name}'")
 
-                    # Rewrite path?
                     if result.path is not None:
                         full_path = result.path
                         hook_context.request_path = full_path
 
-                    # Apply other modifications
-                    if result.method:
-                        # We can't easily change method after body read, but we can log it
-                        logger.info(f"Remapper requested method change to {result.method} (not fully supported yet)")
                     if result.headers:
                         hook_context.request_headers.update(result.headers)
                     if result.body is not None:
@@ -340,13 +293,15 @@ class LockProxy:
                         hook_context.request_headers["content-length"] = str(len(result.body))
 
         # 3. Get locks for the (possibly remapped) backend
-        lock_targets = backend.get_lock_targets(self.backends)
+        # IMPORTANT: Only lock backends in the SAME domain
+        domain = self.domains[backend.domain_name]
+        lock_targets = backend.get_lock_targets(domain.backends)
 
-        # 4. Acquire locks
+        # 4. Acquire locks using domain-specific LockManager
         acquired = True
-        if self.lock_manager and lock_targets:
-            logger.info(f"Acquiring locks {lock_targets} for backend '{backend.name}'")
-            acquired = await self.lock_manager.acquire(backend.name, lock_targets)
+        if lock_targets:
+            logger.info(f"Acquiring locks {lock_targets} for backend '{backend.name}' (domain: {backend.domain_name})")
+            acquired = await domain.lock_manager.acquire(backend.name, lock_targets)
 
         if not acquired:
             logger.warning(
@@ -358,7 +313,7 @@ class LockProxy:
                 headers={"Retry-After": "10"}
             )
 
-        # === Clean activation using activated_backends component ===
+        # 5. Clean activation using activated_backends
         if backend.name not in self.activated_backends:
             self.activated_backends.add(backend.name)
 
@@ -369,16 +324,15 @@ class LockProxy:
                     hook_context
                 )
 
-            if self.lock_manager:
-                await self.lock_manager.acquire(backend.name, [backend.name])
+            # Self-lock within domain
+            await domain.lock_manager.acquire(backend.name, [backend.name])
 
-            # Stop backends this one locks (resource contention declared via `locks:`)
+            # Stop backends this one locks
             for locked_name in lock_targets:
                 locked_lifecycle = self.lifecycle_configs.get(locked_name)
                 if locked_lifecycle and locked_lifecycle.on_deactivate:
                     logger.info(
-                        f"[{backend.name}] Stopping locked backend '{locked_name}' first "
-                        f"(to free resources before activating)"
+                        f"[{backend.name}] Stopping locked backend '{locked_name}' first"
                     )
                     await self.lifecycle_executor.execute(
                         locked_name, locked_lifecycle.on_deactivate, is_activate=False
@@ -391,11 +345,11 @@ class LockProxy:
                     backend.name, lifecycle.on_activate, is_activate=True
                 )
 
-        # Increment in-flight count (used only for LockManager self-lock coordination)
+        # Increment in-flight count
         self.active_counts[backend.name] = self.active_counts.get(backend.name, 0) + 1
 
         try:
-            # Call lifecycle hooks on the final backend
+            # Call lifecycle hooks
             if backend.script:
                 await self.hook_loader.call_hook(
                     self.hook_loader.get_hook(backend.name),
@@ -410,7 +364,6 @@ class LockProxy:
 
             logger.info(f"Forwarding {request.method} {full_path} → {backend.name} ({backend.url})")
 
-            # Include query string from original request
             query_string = f"?{request.url.query}" if request.url.query else ""
             target_url = f"{str(backend.url).rstrip('/')}{full_path}{query_string}"
 
@@ -420,35 +373,22 @@ class LockProxy:
                 if k.lower() not in hop_by_hop
             }
 
-            # === Proper reverse proxy headers (X-Forwarded-*) ===
-            # These are important for backends that log client info, do rate limiting,
-            # virtual hosting internally, or need to know original request context.
             client_ip = request.client.host if request.client else "unknown"
 
-            # X-Forwarded-For: append client IP (preserve chain if already present)
             existing_xff = filtered_headers.get("x-forwarded-for", "")
             if existing_xff:
                 filtered_headers["x-forwarded-for"] = f"{existing_xff}, {client_ip}"
             else:
                 filtered_headers["x-forwarded-for"] = client_ip
 
-            # X-Forwarded-Host: original Host header from client
             original_host = request.headers.get("host", "")
             if original_host:
                 filtered_headers["x-forwarded-host"] = original_host
 
-            # X-Forwarded-Proto: scheme (https/http). Prefer any already-forwarded value.
             proto = request.headers.get("x-forwarded-proto") or getattr(request.url, "scheme", "http")
             filtered_headers["x-forwarded-proto"] = proto
 
-            # X-Real-IP: common convention for the immediate client IP
             filtered_headers["x-real-ip"] = client_ip
-
-            # Prevent backends from returning compressed responses (gzip/deflate/br).
-            # httpx auto-decompresses when it sees Content-Encoding, but then we were
-            # forwarding the original Content-Encoding + Content-Length, causing
-            # "Failed to uncompress gzip stream" (wget) and h11 Content-Length errors.
-            # Forcing "identity" makes backends send plain text (or we strip it anyway).
             filtered_headers["accept-encoding"] = "identity"
 
             req = self.httpx_client.build_request(
@@ -467,10 +407,6 @@ class LockProxy:
             hook_context.response_status = status_code
             hook_context.response_headers = dict(response.headers)
 
-            # Only fully buffer non-streaming responses.
-            # For SSE (text/event-stream), we must NOT call aread() so that
-            # aiter_lines() can stream chunks incrementally from the backend
-            # as they arrive. This enables true streaming to clients.
             if "text/event-stream" not in content_type:
                 response_body = await response.aread()
                 hook_context.response_body = response_body
@@ -478,11 +414,7 @@ class LockProxy:
                 response_body = b""
                 hook_context.response_body = None
 
-            # Run response remapper (if configured).
-            # For SSE responses, response_body is None so remappers that
-            # check `if context.response_body:` (like the think-strip one)
-            # will skip full-body processing and fall through to the
-            # StreamingResponse path (which uses incremental stripper).
+            # Run response remapper
             if backend.remapper:
                 remapper_instance = self.remapper_loader.get_remapper(backend.name)
                 if remapper_instance:
@@ -521,10 +453,6 @@ class LockProxy:
                     headers=dict(response.headers)
                 )
             else:
-                # Clean hop-by-hop and length-related headers from backend so Starlette
-                # can set correct Content-Length based on the body we actually return.
-                # This prevents "Too much data for declared Content-Length" errors
-                # with some backends (especially modern web UIs).
                 clean_response_headers = {
                     k: v for k, v in response.headers.items()
                     if k.lower() not in {
@@ -556,8 +484,8 @@ class LockProxy:
                     hook_context
                 )
 
-            if self.lock_manager and lock_targets:
-                await self.lock_manager.release(backend.name, lock_targets)
+            if lock_targets:
+                await domain.lock_manager.release(backend.name, lock_targets)
                 logger.info(f"Released locks {lock_targets} for backend '{backend.name}'")
 
             if backend.script:
@@ -567,33 +495,12 @@ class LockProxy:
                     hook_context
                 )
 
-            # Decrement in-flight count.
-            # Only release self-lock when we reach zero in-flight requests.
-            # We NEVER run on_deactivate or stop the service here.
-            # Deactivation only happens when another backend that has this one in its `locks:` list activates.
             self.active_counts[backend.name] = max(0, self.active_counts.get(backend.name, 1) - 1)
             if self.active_counts[backend.name] <= 0:
                 self.active_counts[backend.name] = 0
-                if self.lock_manager:
-                    await self.lock_manager.release(backend.name, [backend.name])
-
-                # Note: We intentionally do NOT auto-trigger on_activate for the previously
-                # locked backends here. 
-                # 
-                # Reason: On quick failures (connection error, timeout, etc.) this would
-                # immediately restart the previously stopped service (as you saw with llama-server
-                # coming back after the failed /transcribe). 
-                # 
-                # The critical & safe behavior is only the other direction:
-                #   "When I activate and I lock something → first stop the locked ones"
-                # This prevents resource contention and matches the spirit of your original hook.py.
-                #
-                # If you want the "switch back to alternative when this one goes idle" behavior,
-                # you can add it in a custom hook's on_backend_deactivated, or we can make it
-                # optional via a config flag later.
+                await domain.lock_manager.release(backend.name, [backend.name])
 
     async def _handle_websocket(self, websocket: WebSocket, path: str) -> None:
-        """Handle bidirectional WebSocket proxy with full header forwarding (correct reverse proxy behavior)."""
         full_path = f"/{path}"
         host = websocket.headers.get("host", "")
 
@@ -622,16 +529,17 @@ class LockProxy:
                 if result and result.path:
                     full_path = result.path
 
-        lock_targets = backend.get_lock_targets(self.backends)
+        # Get locks within same domain
+        domain = self.domains[backend.domain_name]
+        lock_targets = backend.get_lock_targets(domain.backends)
 
         acquired = True
-        if self.lock_manager and lock_targets:
-            acquired = await self.lock_manager.acquire(backend.name, lock_targets)
+        if lock_targets:
+            acquired = await domain.lock_manager.acquire(backend.name, lock_targets)
         if not acquired:
             await websocket.close(code=1013, reason="Locked")
             return
 
-        # === Clean activation using activated_backends component ===
         if backend.name not in self.activated_backends:
             self.activated_backends.add(backend.name)
 
@@ -639,29 +547,22 @@ class LockProxy:
                 await self.hook_loader.call_hook(
                     self.hook_loader.get_hook(backend.name), "on_backend_activated", hook_context
                 )
-            if self.lock_manager:
-                await self.lock_manager.acquire(backend.name, [backend.name])
+            await domain.lock_manager.acquire(backend.name, [backend.name])
 
-            # Stop backends this one locks (resource contention)
             for locked_name in lock_targets:
                 locked_lifecycle = self.lifecycle_configs.get(locked_name)
                 if locked_lifecycle and locked_lifecycle.on_deactivate:
-                    logger.info(
-                        f"[{backend.name}] Stopping locked backend '{locked_name}' first "
-                        f"(to free resources before activating)"
-                    )
+                    logger.info(f"[{backend.name}] Stopping locked backend '{locked_name}'")
                     await self.lifecycle_executor.execute(
                         locked_name, locked_lifecycle.on_deactivate, is_activate=False
                     )
 
-            # Activate self
             lifecycle = self.lifecycle_configs.get(backend.name)
             if lifecycle and lifecycle.on_activate:
                 await self.lifecycle_executor.execute(
                     backend.name, lifecycle.on_activate, is_activate=True
                 )
 
-        # Increment in-flight count
         self.active_counts[backend.name] = self.active_counts.get(backend.name, 0) + 1
 
         try:
@@ -675,14 +576,10 @@ class LockProxy:
 
             backend_url_str = str(backend.url).rstrip("/")
             
-            # Include query string from WebSocket URL
             query_string = f"?{websocket.url.query}" if websocket.url.query else ""
             ws_url = ("wss://" if backend_url_str.startswith("https://") else "ws://") + \
                      backend_url_str.split("://", 1)[-1] + full_path + query_string
 
-            # === PROPER REVERSE PROXY HEADER HANDLING ===
-            # Forward ALL headers except true hop-by-hop ones.
-            # This is the correct behavior for a reverse proxy (like nginx/traefik do).
             HOP_BY_HOP = {
                 "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                 "te", "trailer", "transfer-encoding", "upgrade",
@@ -697,7 +594,6 @@ class LockProxy:
 
             client_ip = websocket.client.host if websocket.client else "unknown"
 
-            # X-Forwarded headers
             if "x-forwarded-for" in filtered_headers:
                 filtered_headers["x-forwarded-for"] += f", {client_ip}"
             else:
@@ -711,32 +607,23 @@ class LockProxy:
                 proto = "https" if websocket.url.scheme == "wss" else "http"
             filtered_headers["x-forwarded-proto"] = proto
 
-            # === Force Origin (very important for Socket.IO) ===
-            # Always set Origin based on the Host the client actually used.
-            # This is more reliable than trusting whatever the browser sent.
             origin_host = host or websocket.headers.get("host", "")
             if origin_host:
                 scheme = "https" if proto == "https" or websocket.url.scheme == "wss" else "http"
                 filtered_headers["origin"] = f"{scheme}://{origin_host}"
 
-            # Also set Referer to match
             if "referer" not in filtered_headers and "origin" in filtered_headers:
                 filtered_headers["referer"] = filtered_headers["origin"] + full_path
 
             logger.info(f"Forwarding WebSocket {full_path} → {backend.name} ({ws_url})")
-            logger.debug(f"WebSocket headers being sent: { {k:v for k,v in filtered_headers.items() if k.lower() in ['origin','cookie','authorization','x-forwarded-proto','x-forwarded-host']} }")
 
-            # Socket.IO requires Host header to match the domain, not the backend IP
-            # websockets.connect() sets Host from URI, so we construct URI with correct hostname
             ws_uri = ws_url
             if origin_host:
-                # Replace IP with domain in URI
                 ws_uri = ws_url.replace("127.0.0.1:9090", origin_host)
             
             backend_ws = await websockets.connect(
                 ws_uri,
                 additional_headers=filtered_headers,
-                # Do not pass subprotocols here; let the backend negotiate or reject
             )
 
             await websocket.accept(
@@ -786,22 +673,19 @@ class LockProxy:
                 await self.hook_loader.call_hook(
                     self.hook_loader.get_hook(backend.name), "on_after_request", hook_context
                 )
-            if self.lock_manager and lock_targets:
-                await self.lock_manager.release(backend.name, lock_targets)
+            if lock_targets:
+                await domain.lock_manager.release(backend.name, lock_targets)
             if backend.script:
                 await self.hook_loader.call_hook(
                     self.hook_loader.get_hook(backend.name), "on_locks_released", hook_context
                 )
 
-            # Decrement in-flight count + release self-lock if last request
             self.active_counts[backend.name] = max(0, self.active_counts.get(backend.name, 1) - 1)
             if self.active_counts[backend.name] <= 0:
                 self.active_counts[backend.name] = 0
-                if self.lock_manager:
-                    await self.lock_manager.release(backend.name, [backend.name])
+                await domain.lock_manager.release(backend.name, [backend.name])
 
     async def _stream_sse(self, aiter_lines, backend_name: str = None):
-        """Stream SSE, using remapper's stripper if available."""
         stripper = None
         if backend_name:
             remapper = self.remapper_loader.get_remapper(backend_name)
@@ -830,8 +714,7 @@ class LockProxy:
                                 if stripped is not None:
                                     choice["delta"]["content"] = stripped
                                 else:
-                                    continue  # still buffering think block
-                            # else: no stripper, pass through
+                                    continue
 
                 yield "data: " + json.dumps(chunk) + "\n\n"
 
@@ -839,7 +722,6 @@ class LockProxy:
                 yield line + "\n"
 
     async def _stream_response(self, aiter_bytes, backend_name: str = None):
-        """Stream regular responses, optionally stripping thinking tags."""
         stripper = None
         if backend_name:
             remapper = self.remapper_loader.get_remapper(backend_name)
@@ -851,7 +733,6 @@ class LockProxy:
             chunk_str = chunk.decode('utf-8', errors='replace')
             buffer += chunk_str
             
-            # Try to parse as JSON and strip thinking tags
             try:
                 data = json.loads(buffer)
                 if "choices" in data:
@@ -864,10 +745,8 @@ class LockProxy:
                             )
                 buffer = json.dumps(data)
             except json.JSONDecodeError:
-                # Not complete JSON yet, continue buffering
                 pass
             
-            # Apply streaming stripper if available
             if stripper:
                 stripped = stripper.process_chunk(buffer)
                 if stripped is not None:

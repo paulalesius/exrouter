@@ -1,7 +1,7 @@
 """Configuration loading from YAML with Pydantic validation."""
 
-from pydantic import BaseModel, Field, AnyHttpUrl, field_validator, model_validator
-from typing import Any, Literal, Optional, Union
+from pydantic import BaseModel, Field, AnyHttpUrl, field_validator, model_validator, ConfigDict
+from typing import Any, Literal, Optional
 import yaml
 
 
@@ -38,14 +38,18 @@ class LifecycleConfig(BaseModel):
 
 
 class BackendConfig(BaseModel):
-    """Backend configuration from YAML."""
+    """Backend configuration from YAML.
+    
+    Note: This backend config does NOT include domain_name here - that is set
+    by the LockDomain it belongs to. This keeps the config flat and simple.
+    """
     url: AnyHttpUrl = Field(..., description="Backend server URL (must be http/https)")
     paths: list[str] = Field(
         default_factory=list,
         description="Path patterns this backend handles. "
                     "Use ['*'] or ['/'] (special-cased to match everything) when combining with domain: to own an entire virtual host."
     )
-    locks: list[str] = Field(default_factory=list, description="Other backends to lock while processing")
+    locks: list[str] = Field(default_factory=list, description="Other backends to lock while processing (must be in same domain)")
     domain: list[str] = Field(
         default_factory=list,
         description="Domain / Host header patterns this backend handles (supports fnmatch wildcards like '*.example.com'). "
@@ -66,6 +70,45 @@ class BackendConfig(BaseModel):
         return v or []
 
 
+class LockDomain(BaseModel):
+    """A locking domain - a group of backends that can lock each other.
+    
+    Backends in one domain can only lock other backends in the same domain.
+    This prevents cross-domain deadlocks and enables independent resource management.
+    
+    In YAML, this appears as:
+    backends:
+      compute:  # ← domain name
+        llm:    # ← backend name (directly under domain)
+          url: http://localhost:8080
+        stt:
+          url: http://localhost:7301
+    """
+    
+    model_config = ConfigDict(extra="allow")
+    
+    backends: dict[str, BackendConfig] = Field(default_factory=dict)
+    
+    def __init__(self, **data):
+        """Parse backends from extra fields.
+        
+        Any field that is a dict is treated as a BackendConfig.
+        """
+        # Extract known fields
+        known_fields = {'backends'}
+        extra_data = {k: v for k, v in data.items() if k not in known_fields}
+        
+        # Initialize with explicit backends if provided
+        backends_dict = data.get('backends', {})
+        
+        # Add extra fields as backends
+        for name, config_data in extra_data.items():
+            if isinstance(config_data, dict):
+                backends_dict[name] = config_data
+        
+        super().__init__(backends=backends_dict)
+
+
 class GlobalLockConfig(BaseModel):
     """Global lock settings."""
     enabled: bool = Field(default=True, description="Enable global locking")
@@ -79,30 +122,64 @@ class ServerConfig(BaseModel):
 
 
 class Config(BaseModel):
-    """Full proxy configuration with validation."""
+    """Full proxy configuration with validation.
+    
+    The backends field is now hierarchical:
+    - Top level: domain names (e.g. "compute", "frontend", "audio")
+    - Second level: backend configs within each domain
+    
+    Locks are validated to only reference backends within the same domain.
+    """
     server: ServerConfig = Field(default_factory=ServerConfig)
-    backends: dict[str, BackendConfig] = Field(default_factory=dict)
+    backends: dict[str, LockDomain] = Field(
+        ...,
+        description="Locking domains. Each domain contains backends that can lock each other."
+    )
     global_lock: GlobalLockConfig = Field(default_factory=GlobalLockConfig)
 
     @model_validator(mode='after')
     def validate_lock_targets_exist(self) -> "Config":
-        """Ensure that all lock targets actually exist as backends."""
-        backend_names = set(self.backends.keys())
-        for name, backend in self.backends.items():
-            for lock in backend.locks:
-                if lock not in backend_names:
-                    raise ValueError(
-                        f"Backend '{name}' tries to lock '{lock}', "
-                        f"but no backend named '{lock}' exists."
-                    )
+        """Ensure that all lock targets exist within the same domain.
+        
+        Validates:
+        1. Each backend's locks reference backends that exist
+        2. Lock targets are in the SAME domain (cross-domain locks not allowed)
+        """
+        for domain_name, domain in self.backends.items():
+            domain_backend_names = set(domain.backends.keys())
+            
+            for backend_name, backend in domain.backends.items():
+                for lock_target in backend.locks:
+                    # Check if lock target exists ANYWHERE
+                    found_anywhere = False
+                    found_in_same_domain = False
+                    
+                    for other_domain_name, other_domain in self.backends.items():
+                        if lock_target in other_domain.backends:
+                            found_anywhere = True
+                            if other_domain_name == domain_name:
+                                found_in_same_domain = True
+                    
+                    if not found_anywhere:
+                        raise ValueError(
+                            f"Backend '{backend_name}' in domain '{domain_name}' "
+                            f"tries to lock '{lock_target}', but no backend named '{lock_target}' exists anywhere."
+                        )
+                    
+                    if not found_in_same_domain:
+                        # Find which domain it's in for better error message
+                        lock_domain = None
+                        for dn, d in self.backends.items():
+                            if lock_target in d.backends:
+                                lock_domain = dn
+                                break
+                        raise ValueError(
+                            f"Backend '{backend_name}' in domain '{domain_name}' "
+                            f"tries to lock '{lock_target}', but '{lock_target}' is in domain '{lock_domain}'. "
+                            f"Locks can only target backends within the same domain."
+                        )
+        
         return self
-
-    # Note: We intentionally do NOT validate that domain patterns are unique.
-    # Multiple backends are allowed to declare the same domain (or overlapping
-    # domain patterns) as long as they use different `paths:`. The _find_backend()
-    # method in LockProxy disambiguates by requiring BOTH domain and path to match.
-    # This enables virtual hosting setups (e.g. api.example.com/chat vs /embed
-    # on different backends) as documented.
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
