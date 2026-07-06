@@ -1,4 +1,4 @@
-# EXRouter - Exclusive Router v1.1.0
+# EXRouter - Exclusive Router
 
 A declarative backend proxy with **global locking for VRAM/resource-aware scheduling** and request remapping. Routes requests to configured backends and manages cross-backend exclusive locks to enable efficient hardware utilization.
 
@@ -54,6 +54,15 @@ It supports advanced routing needs through **request remapping** and **domain-ba
 **Resource Coordination via Locks**  
 The `locks:` declarations in the example above are the heart of the VRAM-reuse innovation: the reranker will wait for both LLM and embeddings backends to be free before processing, preventing VRAM contention. LLM waits for embeddings, etc. Multiple requests to the *same* backend run concurrently without blocking.
 
+## Environment Variables
+
+Server configuration is done via environment variables:
+
+```bash
+export EXROUTER_HOST=0.0.0.0
+export EXROUTER_PORT=4001
+```
+
 ## Quick Start
 
 ```bash
@@ -75,10 +84,6 @@ All configuration is done through YAML.
 ### Config Structure
 
 ```yaml
-server:
-  host: 0.0.0.0
-  port: 4001
-
 global_lock:
   enabled: true
   timeout: 300
@@ -296,18 +301,6 @@ class BackendHook:
 
 - `enabled`: Whether locking is active
 - `timeout`: Seconds to wait for locks (returns 503 if exceeded)
-
-### Environment Variables
-
-Server configuration can be overridden via environment variables:
-
-- `EXROUTER_HOST`: Host to bind to (default: `0.0.0.0`)
-- `EXROUTER_PORT`: Port to listen on (default: `4001`)
-
-Example:
-```bash
-EXROUTER_HOST=127.0.0.1 EXROUTER_PORT=8080 uv run python -m exrouter.main
-```
 
 ## How Locking Works
 
