@@ -97,25 +97,12 @@ class Config(BaseModel):
                     )
         return self
 
-    @model_validator(mode='after')
-    def validate_unique_domains(self) -> "Config":
-        """Ensure domain patterns are unique across backends (case-insensitive).
-        
-        This prevents ambiguous routing when multiple backends claim the same domain.
-        """
-        seen_domains: dict[str, str] = {}  # normalized_lower -> backend_name
-        for name, backend in self.backends.items():
-            for d in backend.domain:
-                norm = d.lower().strip()
-                if not norm:
-                    continue
-                if norm in seen_domains:
-                    raise ValueError(
-                        f"Domain pattern '{d}' is claimed by both backend '{name}' and "
-                        f"'{seen_domains[norm]}'. Domain patterns must be unique."
-                    )
-                seen_domains[norm] = name
-        return self
+    # Note: We intentionally do NOT validate that domain patterns are unique.
+    # Multiple backends are allowed to declare the same domain (or overlapping
+    # domain patterns) as long as they use different `paths:`. The _find_backend()
+    # method in LockProxy disambiguates by requiring BOTH domain and path to match.
+    # This enables virtual hosting setups (e.g. api.example.com/chat vs /embed
+    # on different backends) as documented.
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
