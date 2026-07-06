@@ -1,6 +1,6 @@
 server:
   host: 0.0.0.0
-  port: 4001
+  port: 4002
 
 global_lock:
   enabled: true
@@ -8,137 +8,140 @@ global_lock:
 
 backends:
 
-  llm:
-    url: "http://127.0.0.1:8080"
-    paths:
-      # OpenAI
-      - "/v1/chat/completions"
-      - "/v1/completions"
-      - "/v1/models"
-      - "/v1/models/*"
-      - "/v1/responses"
-      - "/v1/responses/*"
+  compute:
+    llm:
+      url: "http://127.0.0.1:8080"
+      paths:
+        # OpenAI
+        - "/v1/chat/completions"
+        - "/v1/completions"
+        - "/v1/models"
+        - "/v1/models/*"
+        - "/v1/responses"
+        - "/v1/responses/*"
 
-      # Ollama compatible
-      - "/api/tags"
-      - "/api/show"
-      - "/api/ps"
-      - "/api/v1/models"
-      - "/api/v1/models/*"
+        # Ollama compatible
+        - "/api/tags"
+        - "/api/show"
+        - "/api/ps"
+        - "/api/v1/models"
+        - "/api/v1/models/*"
 
-      # llama.cpp specific
-      - "/v1/props"
-      - "/props"
-      - "/version"
-      - "/health"
-      - "/v1/tokenize"
-      - "/v1/detokenize"
-    #script: "/src/exrouter/samples/hook.py"
-    remapper: "/src/exrouter/samples/llm-think-strip-remapper.py"
-    locks: [stt_custom]
-    lifecycle:
-      on_activate:
-        systemd:
-          start: [llama-server.service]
-        shell:
-          - |
-            echo "Example on_activate script too"
-      on_deactivate:
-        systemd:
-          stop: [llama-server.service]
-      wait_for:
-        - type: port
-          host: 127.0.0.1
-          port: 8080
-          timeout: 20
+        # llama.cpp specific
+        - "/v1/props"
+        - "/props"
+        - "/version"
+        - "/health"
+        - "/v1/tokenize"
+        - "/v1/detokenize"
+      #script: "/src/exrouter/samples/hook.py"
+      remapper: "/src/exrouter/samples/llm-think-strip-remapper.py"
+      locks: [stt_custom]
+      lifecycle:
+        on_activate:
+          systemd:
+            start: [llama-server.service]
+          shell:
+            - |
+              echo "Example on_activate script too"
+        on_deactivate:
+          systemd:
+            stop: [llama-server.service]
+        wait_for:
+          - type: port
+            host: 127.0.0.1
+            port: 8080
+            timeout: 20
 
-  # stt_custom is a custom endpoint that takes a POST
-  # request to /transcribe and returns the result. It locks
-  # the llm backend because it needs its resources, the script
-  # will stop the llm.service and start stt_custom.service before
-  # entering the backend.
-  #
+    # stt_custom is a custom endpoint that takes a POST
+    # request to /transcribe and returns the result. It locks
+    # the llm backend because it needs its resources, the script
+    # will stop the llm.service and start stt_custom.service before
+    # entering the backend.
+    #
+    stt_custom:
+      url: "http://127.0.0.1:7301"
+      paths: ["/transcribe"]
+      locks: [llm]
+      lifecycle:
+        on_activate: { systemd: { start: [stt-custom.service] }}
+        on_deactivate: { systemd: { stop: [stt-custom.service]} }
+
+    # Demonstration of a llama-server, the paths are TEI paths, but
+    # we use a remapper to remap to llama-server paths
+    embed:
+      url: "http://127.0.0.1:8081"
+      remapper: "/src/exrouter/samples/llama-server-embedding-tei-remapper.py"
+      paths:
+        - "/v1/info"
+        - "/v1/embed"
+        - "/embed"
+        - "/v1/embeddings"
+        - "/embeddings"
+        - "/v1/models"
+      locks: []
+
+    rerank:
+      url: "http://127.0.0.1:8082"
+      remapper: "/src/exrouter/samples/llama-server-rerank-tei-remapper.py"
+      paths:
+        - "/v1/rerank"
+        - "/rerank"
+        - "/v1/reranking"
+      locks: []
+
+    vision:
+      url: "http://127.0.0.1:8083"
+      paths:
+        - "/v1/vision/chat/completions"
+        - "/v1/vision/*"
+      locks: []
+
+    stt:
+      url: "http://127.0.0.1:8084"
+      paths:
+        - "/v1/audio/transcriptions"
+        - "/v1/audio/translations"
+      locks: []
+
+    tts:
+      url: "http://127.0.0.1:7852"
+      paths:
+        - "/v1/audio/speech"
+      locks: []
+
   # @NOTE It is a really bad idea to perform locking on the frontend
   # if you also perform locking on backends, because the backend
   # may call the frontend again which is locked. This will be fixed
   # but for now take care about what you lock.
-  stt_custom:
-    url: "http://127.0.0.1:7301"
-    paths: ["/transcribe"]
-    locks: [llm]
-    lifecycle:
-      on_activate: { systemd: { start: [stt-custom.service] }}
-      on_deactivate: { systemd: { stop: [stt-custom.service]} }
-  # Don't forget env var CORS_ALLOW_ORIGIN=* for the service
-  # so its websocket endpoints allow exrouter
-  open-webui:
-    url: "http://127.0.0.1:9090"
-    domain: ["openwebui.unnsvc.org"]
-    paths: ["/"]
-    locks: [hermes-dashboard, hermes-webui]
-    lifecycle:
-      on_activate: { systemd: { start: [open-webui.service] } }
-      on_deactivate: { systemd: { stop: [open-webui.service]} }
-  hermes-dashboard:
-    url: "http://127.0.0.1:9119"
-    domain: ["dashboard.unnsvc.org"]
-    paths: ["/"]
-    locks: [open-webui, hermes-webui]
-    lifecycle:
-      on_activate: { systemd: { start: [hermes-dashboard.service] } }
-      on_deactivate: { systemd: { stop: [hermes-dashboard.service]} }
-  hermes-webui:
-    url: "http://127.0.0.1:9100"
-    domain: ["webui.unnsvc.org"]
-    paths: ["/"]
-    locks: [open-webui, hermes-dashboard]
-    lifecycle:
-      on_activate: { systemd: { start: [hermes-webui.service] } }
-      on_deactivate: { systemd: { stop: [hermes-webui.service]} }
-  langfuse:
-    url: "http://127.0.0.1:7509"
-    domain: ["langfuse.unnsvc.org"]
-    paths: ["/"]
-
-  # Demonstration of a llama-server, the paths are TEI paths, but
-  # we use a remapper to remap to llama-server paths
-  embed:
-    url: "http://127.0.0.1:8081"
-    remapper: "/src/exrouter/samples/llama-server-embedding-tei-remapper.py"
-    paths:
-      - "/v1/info"
-      - "/v1/embed"
-      - "/embed"
-      - "/v1/embeddings"
-      - "/embeddings"
-      - "/v1/models"
-    locks: []
-
-  rerank:
-    url: "http://127.0.0.1:8082"
-    remapper: "/src/exrouter/samples/llama-server-rerank-tei-remapper.py"
-    paths:
-      - "/v1/rerank"
-      - "/rerank"
-      - "/v1/reranking"
-    locks: []
-
-  vision:
-    url: "http://127.0.0.1:8083"
-    paths:
-      - "/v1/vision/chat/completions"
-      - "/v1/vision/*"
-    locks: []
-
-  stt:
-    url: "http://127.0.0.1:8084"
-    paths:
-      - "/v1/audio/transcriptions"
-      - "/v1/audio/translations"
-    locks: []
-
-  tts:
-    url: "http://127.0.0.1:7852"
-    paths:
-      - "/v1/audio/speech"
-    locks: []
+  # # Don't forget env var CORS_ALLOW_ORIGIN=* for the service
+  # # so its websocket endpoints allow exrouter
+  frontend:
+    open-webui:
+      url: "http://127.0.0.1:9090"
+      domain: ["openwebui.unnsvc.org"]
+      paths: ["/"]
+      locks: [hermes-dashboard, hermes-webui]
+      lifecycle:
+        on_activate: { systemd: { start: [open-webui.service] } }
+        on_deactivate: { systemd: { stop: [open-webui.service]} }
+    hermes-dashboard:
+      url: "http://127.0.0.1:9119"
+      domain: ["dashboard.unnsvc.org"]
+      paths: ["/"]
+      locks: [open-webui, hermes-webui]
+      lifecycle:
+        on_activate: { systemd: { start: [hermes-dashboard.service] } }
+        on_deactivate: { systemd: { stop: [hermes-dashboard.service]} }
+    hermes-webui:
+      url: "http://127.0.0.1:9100"
+      domain: ["webui.unnsvc.org"]
+      paths: ["/"]
+      locks: [open-webui, hermes-dashboard]
+      lifecycle:
+        on_activate: { systemd: { start: [hermes-webui.service] } }
+        on_deactivate: { systemd: { stop: [hermes-webui.service]} }
+    langfuse:
+      url: "http://127.0.0.1:7509"
+      domain: ["langfuse.unnsvc.org"]
+      paths: ["/"]

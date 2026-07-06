@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from typing import Optional
 
 import websockets
+from websockets.client import WebSocketClientProtocol
 from websockets.exceptions import ConnectionClosed, InvalidStatusCode
 
 from fastapi import FastAPI, Request, Response, WebSocket
@@ -30,6 +31,7 @@ from .domain import LockDomain
 from .hooks import HookLoader, HookContext
 from .lifecycle import LifecycleExecutor
 from .remapper import RemapperLoader, RemapResult
+from .websocket_pool import WebSocketPool
 
 logger = logging.getLogger("exrouter")
 
@@ -161,7 +163,10 @@ class LockProxy:
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
             timeout=httpx.Timeout(300.0, connect=30.0)
         )
-
+        
+        # WebSocket connection pool
+        self.ws_pool = WebSocketPool(max_idle_seconds=300, max_connections=100)
+        
         # Create FastAPI app
         self.app = FastAPI(title="EXRouter")
         self.app.add_middleware(RequestLoggingMiddleware)
@@ -573,63 +578,61 @@ class LockProxy:
                 await self.hook_loader.call_hook(
                     self.hook_loader.get_hook(backend.name), "on_before_request", hook_context
                 )
-
+            
             backend_url_str = str(backend.url).rstrip("/")
             
             query_string = f"?{websocket.url.query}" if websocket.url.query else ""
             ws_url = ("wss://" if backend_url_str.startswith("https://") else "ws://") + \
                      backend_url_str.split("://", 1)[-1] + full_path + query_string
-
+            
             HOP_BY_HOP = {
                 "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                 "te", "trailer", "transfer-encoding", "upgrade",
                 "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
                 "sec-websocket-accept", "sec-websocket-protocol"
             }
-
+            
             filtered_headers = {
                 k: v for k, v in hook_context.request_headers.items()
                 if k.lower() not in HOP_BY_HOP
             }
-
+            
             client_ip = websocket.client.host if websocket.client else "unknown"
-
+            
             if "x-forwarded-for" in filtered_headers:
                 filtered_headers["x-forwarded-for"] += f", {client_ip}"
             else:
                 filtered_headers["x-forwarded-for"] = client_ip
-
+            
             filtered_headers["x-forwarded-host"] = host or websocket.headers.get("host", "")
             filtered_headers["x-real-ip"] = client_ip
-
+            
             proto = websocket.headers.get("x-forwarded-proto")
             if not proto:
                 proto = "https" if websocket.url.scheme == "wss" else "http"
             filtered_headers["x-forwarded-proto"] = proto
-
+            
             origin_host = host or websocket.headers.get("host", "")
             if origin_host:
                 scheme = "https" if proto == "https" or websocket.url.scheme == "wss" else "http"
                 filtered_headers["origin"] = f"{scheme}://{origin_host}"
-
+            
             if "referer" not in filtered_headers and "origin" in filtered_headers:
                 filtered_headers["referer"] = filtered_headers["origin"] + full_path
-
-            logger.info(f"Forwarding WebSocket {full_path} → {backend.name} ({ws_url})")
-
-            ws_uri = ws_url
-            if origin_host:
-                ws_uri = ws_url.replace("127.0.0.1:9090", origin_host)
             
-            backend_ws = await websockets.connect(
-                ws_uri,
-                additional_headers=filtered_headers,
+            logger.info(f"Forwarding WebSocket {full_path} → {backend.name} ({ws_url})")
+            
+            # Get connection from pool (reuses existing or creates new)
+            backend_ws = await self.ws_pool.get_connection(
+                backend_name=backend.name,
+                ws_url=ws_url,
+                additional_headers=filtered_headers
             )
-
+            
             await websocket.accept(
                 subprotocol=backend_ws.subprotocol if hasattr(backend_ws, "subprotocol") else None
             )
-
+            
             async def client_to_backend():
                 try:
                     while True:
@@ -643,9 +646,13 @@ class LockProxy:
                 except Exception:
                     pass
                 finally:
-                    if not backend_ws.closed:
-                        await backend_ws.close()
-
+                    # Release back to pool instead of closing
+                    await self.ws_pool.release_connection(
+                        backend_name=backend.name,
+                        ws_url=ws_url,
+                        ws=backend_ws
+                    )
+            
             async def backend_to_client():
                 try:
                     async for message in backend_ws:
@@ -661,7 +668,7 @@ class LockProxy:
                             await websocket.close()
                         except Exception:
                             pass
-
+            
             await asyncio.gather(client_to_backend(), backend_to_client(), return_exceptions=True)
 
         except Exception as e:
@@ -757,6 +764,7 @@ class LockProxy:
 
     async def shutdown(self):
         await self.httpx_client.aclose()
+        await self.ws_pool.stop()
 
     async def run(self) -> None:
         import uvicorn
@@ -768,6 +776,10 @@ class LockProxy:
             access_log=False,
         )
         server = uvicorn.Server(config)
+        
+        # Start WebSocket pool
+        await self.ws_pool.start()
+        
         try:
             await server.serve()
         finally:
