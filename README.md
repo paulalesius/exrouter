@@ -24,7 +24,7 @@ It supports advanced routing needs through **request remapping**, allowing you t
 - **Streaming Support**: SSE and regular responses streamed without buffering
 - **Timeout Handling**: Configurable lock timeouts with `503 + Retry-After`
 - **Hop-by-Hop Header Filtering**: Proper HTTP proxy behavior
-- **Lifecycle Hooks**: Run custom code on backend activation/deactivation (ideal for managing systemd services or dynamic model loading/unloading to further optimize VRAM)
+- **Lifecycle Management**: Declarative `lifecycle:` blocks to manage a backend's own service (systemd, shell, wait_for). Automatically stops conflicting locked backends on activation. Backends with `locks:` stay running until another conflicting backend activates. Can be combined with custom Python hooks.
 - **Error Propagation**: Backend HTTP status codes are forwarded correctly
 
 ## Architecture
@@ -105,13 +105,14 @@ Each backend specifies:
 
 ### Declarative Lifecycle Management
 
-Instead of (or in addition to) writing Python hook scripts, you can declaratively manage backend services using the `lifecycle:` key:
+EXRouter supports declarative lifecycle management via the `lifecycle:` key under each backend. This is the recommended way to start, stop, and wait for backend services (especially when using systemd).
+
+Example:
 
 ```yaml
 llm:
   url: http://127.0.0.1:8080
-  paths:
-    - /v1/chat/completions
+  paths: [/v1/chat/completions]
   locks: [stt_custom]
   lifecycle:
     on_activate:
@@ -125,24 +126,16 @@ llm:
     on_deactivate:
       systemd:
         stop: [llama-server.service]
+```
 
-stt_custom:
-  url: http://127.0.0.1:7301
-  paths: [/transcribe]
-  locks: [llm]
-  lifecycle:
-    on_activate:
-      systemd:
-        start: [stt-custom.target]
-      wait_for:
-        - type: port
-          host: 127.0.0.1
-          port: 7301
-          timeout: 30
-    on_deactivate:
-      systemd:
-        stop: [stt-custom.target]
- ```
+**Important rules and behavior:**
+
+- The `on_activate` and `on_deactivate` actions defined for a backend are **only intended to manage that backend's own service**. Do **not** use them to manually start or stop *other* services. Doing so can cause race conditions and nasty locking issues.
+- When a backend activates, EXRouter **automatically** stops any backends listed in its `locks:` array (by calling their `on_deactivate`) *before* running the current backend's `on_activate`.
+- Backends that declare `locks:` **stay running** once activated. They are **not** automatically stopped when their request count reaches zero. They only get stopped when another backend that conflicts with them activates.
+- This design gives you clean "mode switching" behavior between mutually exclusive heavy services (e.g. LLM ↔ Speech-to-Text) while keeping the previously active service warm.
+
+You can combine `lifecycle:` with custom Python hook scripts (`script:`) if you need more complex logic.
 
 ### Request Remappers
 
