@@ -84,30 +84,52 @@ class LockDomain(BaseModel):
           url: http://localhost:8080
         stt:
           url: http://localhost:7301
-    """
     
-    model_config = ConfigDict(extra="allow")
+    When serialized to JSON, this becomes:
+    {"domains": {"compute": {"backends": {"llm": {...}, "stt": {...}}}}}
+    """
     
     backends: dict[str, BackendConfig] = Field(default_factory=dict)
     
-    def __init__(self, **data):
-        """Parse backends from extra fields.
+    @model_validator(mode='before')
+    @classmethod
+    def parse_backends_from_yaml(cls, data: Any) -> Any:
+        """Parse backends from YAML structure.
         
-        Any field that is a dict is treated as a BackendConfig.
+        YAML structure:
+        compute:
+          llm:
+            url: ...
+          stt:
+            url: ...
+        
+        This validator extracts all dict fields (backend configs) and puts them
+        into the 'backends' dict.
         """
-        # Extract known fields
-        known_fields = {'backends'}
-        extra_data = {k: v for k, v in data.items() if k not in known_fields}
+        if not isinstance(data, dict):
+            return data
         
-        # Initialize with explicit backends if provided
-        backends_dict = data.get('backends', {})
+        # Extract backend configs (all dict fields except 'backends')
+        backend_configs = {}
+        for key, value in data.items():
+            if key == 'backends':
+                continue
+            if isinstance(value, dict):
+                backend_configs[key] = BackendConfig.model_validate(value)
         
-        # Add extra fields as backends
-        for name, config_data in extra_data.items():
-            if isinstance(config_data, dict):
-                backends_dict[name] = config_data
+        # Return data with 'backends' field populated
+        result = dict(data)
+        if backend_configs:
+            result['backends'] = backend_configs
         
-        super().__init__(backends=backends_dict)
+        return result
+    
+    def model_dump(self, *args, **kwargs) -> dict:
+        """Custom serialization to avoid nested 'backends' key.
+        
+        Returns: {"backends": {...}} instead of {"name": "...", "backends": {...}}
+        """
+        return {"backends": self.backends}
 
 
 class GlobalLockConfig(BaseModel):
@@ -153,15 +175,16 @@ class ServerConfig(BaseModel):
 class Config(BaseModel):
     """Full proxy configuration with validation.
     
-    The backends field is now hierarchical:
+    The domains field is hierarchical:
     - Top level: domain names (e.g. "compute", "frontend", "audio")
     - Second level: backend configs within each domain
     
     Locks are validated to only reference backends within the same domain.
     """
     server: ServerConfig = Field(default_factory=ServerConfig)
-    backends: dict[str, LockDomain] = Field(
+    domains: dict[str, LockDomain] = Field(
         ...,
+        alias="backends",
         description="Locking domains. Each domain contains backends that can lock each other."
     )
     global_lock: GlobalLockConfig = Field(default_factory=GlobalLockConfig)
@@ -174,7 +197,7 @@ class Config(BaseModel):
         1. Each backend's locks reference backends that exist
         2. Lock targets are in the SAME domain (cross-domain locks not allowed)
         """
-        for domain_name, domain in self.backends.items():
+        for domain_name, domain in self.domains.items():
             domain_backend_names = set(domain.backends.keys())
             
             for backend_name, backend in domain.backends.items():
@@ -183,7 +206,7 @@ class Config(BaseModel):
                     found_anywhere = False
                     found_in_same_domain = False
                     
-                    for other_domain_name, other_domain in self.backends.items():
+                    for other_domain_name, other_domain in self.domains.items():
                         if lock_target in other_domain.backends:
                             found_anywhere = True
                             if other_domain_name == domain_name:
@@ -198,7 +221,7 @@ class Config(BaseModel):
                     if not found_in_same_domain:
                         # Find which domain it's in for better error message
                         lock_domain = None
-                        for dn, d in self.backends.items():
+                        for dn, d in self.domains.items():
                             if lock_target in d.backends:
                                 lock_domain = dn
                                 break

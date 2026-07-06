@@ -9,7 +9,7 @@ Group=root
 Environment=UV_PROJECT_ENVIRONMENT=/home/noname/venv-exrouter
 WorkingDirectory=/src/exrouter
 Environment=EXROUTER_HOST=0.0.0.0
-Environment=EXROUTER_PORT=4002
+Environment=EXROUTER_PORT=4001
 ExecStart=/usr/bin/env /usr/local/bin/uv run --project /src/exrouter python -m src.exrouter.main --config /src/exrouter/samples/config.yaml
 Restart=always
 RestartSec=5s

@@ -39,7 +39,7 @@ def main():
         config.server = ServerConfig.from_env()
         
         logger.info("EXRouter v1.1.0 starting up (with request remapping)")
-        logger.info(f"Backends: {list(config.backends.keys())}")
+        logger.info(f"Domains: {list(config.domains.keys())}")
         logger.info(f"Global locking: {'enabled' if config.global_lock.enabled else 'disabled'}")
         logger.info(f"Starting on {config.server.host}:{config.server.port}")
 

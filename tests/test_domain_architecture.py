@@ -38,13 +38,13 @@ global_lock:
     config = Config.from_dict(__import__('yaml').safe_load(config_yaml))
     
     # Check domains exist
-    assert 'compute' in config.backends
-    assert 'frontend' in config.backends
+    assert 'compute' in config.domains
+    assert 'frontend' in config.domains
     
     # Check backends are in correct domains
-    assert 'llm' in config.backends['compute'].backends
-    assert 'stt' in config.backends['compute'].backends
-    assert 'webui' in config.backends['frontend'].backends
+    assert 'llm' in config.domains['compute'].backends
+    assert 'stt' in config.domains['compute'].backends
+    assert 'webui' in config.domains['frontend'].backends
 
 
 def test_backend_domain_assignment():
@@ -224,8 +224,9 @@ global_lock:
     config_dict = proxy.config.model_dump()
     assert isinstance(config_dict, dict)
     assert 'server' in config_dict
-    assert 'backends' in config_dict
-    assert 'compute' in config_dict['backends']
+    assert 'domains' in config_dict
+    assert 'compute' in config_dict['domains']
+    assert 'backends' in config_dict['domains']['compute']
 
 
 if __name__ == '__main__':

@@ -110,7 +110,7 @@ class LockProxy:
         # Lifecycle configs per backend
         self.lifecycle_configs: dict[str, Optional[LifecycleConfig]] = {}
 
-        for domain_name, domain_config in config.backends.items():
+        for domain_name, domain_config in config.domains.items():
             # Build Backend instances for this domain
             domain_backends: dict[str, Backend] = {}
             
