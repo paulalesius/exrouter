@@ -57,6 +57,11 @@ backends:
   # the llm backend because it needs its resources, the script
   # will stop the llm.service and start stt_custom.service before
   # entering the backend.
+  #
+  # @NOTE It is a really bad idea to perform locking on the frontend
+  # if you also perform locking on backends, because the backend
+  # may call the frontend again which is locked. This will be fixed
+  # but for now take care about what you lock.
   stt_custom:
     url: "http://127.0.0.1:7301"
     paths: ["/transcribe"]
