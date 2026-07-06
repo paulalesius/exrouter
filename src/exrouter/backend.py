@@ -1,6 +1,6 @@
 """Backend component - represents a single backend with paths and locks."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import fnmatch
 
@@ -14,6 +14,7 @@ class Backend:
     - url: Backend server URL
     - paths: List of path patterns this backend handles
     - locks: List of other backend names to lock while processing
+    - domain: List of domain/Host patterns (optional). If non-empty, BOTH domain and path must match.
     - script: Optional path to hook script
     - remapper: Optional path to request remapper script
     """
@@ -21,17 +22,50 @@ class Backend:
     url: str
     paths: list[str]
     locks: list[str]
+    domain: list[str] = field(default_factory=list)
     script: Optional[str] = None
     remapper: Optional[str] = None
 
     def matches_path(self, path: str) -> bool:
-        """Check if this backend handles the given path."""
+        """Check if this backend handles the given path.
+
+        Special case: if "/" is listed in paths (common when using domain: for full
+        virtual hosting of a web UI), it matches *any* path under that domain.
+        This makes configs like paths: ["/"] + domain: ["foo.example.com"] work
+        as "this entire domain belongs to this backend".
+        """
+        if not self.paths:
+            return False
         for pattern in self.paths:
+            if pattern == "/":
+                return True
             if "*" in pattern:
                 if fnmatch.fnmatch(path, pattern):
                     return True
             else:
                 if path == pattern:
+                    return True
+        return False
+
+    def matches_domain(self, host: str) -> bool:
+        """Check if this backend handles the given Host header (domain matching).
+        
+        Supports exact match and fnmatch wildcards (e.g. '*.example.com').
+        Case-insensitive. Port in Host header is ignored.
+        """
+        if not self.domain:
+            return False
+        # Normalize: strip port, lower case
+        host = host.split(":")[0].lower().strip()
+        for pattern in self.domain:
+            p = pattern.lower().strip()
+            if not p:
+                continue
+            if "*" in p:
+                if fnmatch.fnmatch(host, p):
+                    return True
+            else:
+                if host == p:
                     return True
         return False
 

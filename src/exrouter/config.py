@@ -1,7 +1,7 @@
 """Configuration loading from YAML with Pydantic validation."""
 
 from pydantic import BaseModel, Field, AnyHttpUrl, field_validator, model_validator
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 import yaml
 
 
@@ -40,8 +40,18 @@ class LifecycleConfig(BaseModel):
 class BackendConfig(BaseModel):
     """Backend configuration from YAML."""
     url: AnyHttpUrl = Field(..., description="Backend server URL (must be http/https)")
-    paths: list[str] = Field(default_factory=list, description="Path patterns this backend handles")
+    paths: list[str] = Field(
+        default_factory=list,
+        description="Path patterns this backend handles. "
+                    "Use ['*'] or ['/'] (special-cased to match everything) when combining with domain: to own an entire virtual host."
+    )
     locks: list[str] = Field(default_factory=list, description="Other backends to lock while processing")
+    domain: list[str] = Field(
+        default_factory=list,
+        description="Domain / Host header patterns this backend handles (supports fnmatch wildcards like '*.example.com'). "
+                    "If specified, BOTH domain and path must match. "
+                    "Combine with paths: ['*'] or paths: ['/'] to give one backend full ownership of that domain."
+    )
     script: Optional[str] = Field(default=None, description="Path to Python hook script")
     remapper: Optional[str] = Field(default=None, description="Path to Python request remapper script")
     lifecycle: Optional[LifecycleConfig] = Field(
@@ -50,7 +60,7 @@ class BackendConfig(BaseModel):
                     "Alternative to writing a full hook script for common resource management use cases."
     )
 
-    @field_validator('paths', 'locks', mode='before')
+    @field_validator('paths', 'locks', 'domain', mode='before')
     @classmethod
     def ensure_list(cls, v: Any) -> list[str]:
         return v or []
@@ -85,6 +95,26 @@ class Config(BaseModel):
                         f"Backend '{name}' tries to lock '{lock}', "
                         f"but no backend named '{lock}' exists."
                     )
+        return self
+
+    @model_validator(mode='after')
+    def validate_unique_domains(self) -> "Config":
+        """Ensure domain patterns are unique across backends (case-insensitive).
+        
+        This prevents ambiguous routing when multiple backends claim the same domain.
+        """
+        seen_domains: dict[str, str] = {}  # normalized_lower -> backend_name
+        for name, backend in self.backends.items():
+            for d in backend.domain:
+                norm = d.lower().strip()
+                if not norm:
+                    continue
+                if norm in seen_domains:
+                    raise ValueError(
+                        f"Domain pattern '{d}' is claimed by both backend '{name}' and "
+                        f"'{seen_domains[norm]}'. Domain patterns must be unique."
+                    )
+                seen_domains[norm] = name
         return self
 
     @classmethod

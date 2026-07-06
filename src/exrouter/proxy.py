@@ -141,6 +141,7 @@ class LockProxy:
                 url=str(backend_config.url),
                 paths=backend_config.paths,
                 locks=backend_config.locks,
+                domain=backend_config.domain,
                 script=backend_config.script,
                 remapper=backend_config.remapper,
             )
@@ -184,9 +185,11 @@ class LockProxy:
         self._setup_routes()
 
     def _setup_routes(self) -> None:
-        @self.app.get("/")
-        async def root():
-            return {"name": "EXRouter", "version": "1.0.0"}
+        # Note: We deliberately do NOT register a literal "/" route here.
+        # The catch-all "/{path:path}" below handles root requests so that
+        # domain-based backends with paths: ["/"] or paths: ["*"] can serve
+        # the homepage and all sub-paths of their domain.
+        # /health remains internal to EXRouter for monitoring.
 
         @self.app.get("/health")
         async def health():
@@ -196,19 +199,57 @@ class LockProxy:
         async def proxy_request(request: Request, path: str):
             return await self._handle_request(request, path)
 
+    def _find_backend(self, request: Request, path: str) -> Optional[Backend]:
+        """Select backend using combined domain + path matching.
+        
+        Rules (as requested):
+        - If the incoming request's Host header matches ANY backend's declared `domain`,
+          then ONLY backends that declare a matching domain are eligible.
+        - Pure path-based backends (no `domain:` declared) are ignored in that case.
+        - Multiple backends can share the same domain but use different `paths:`.
+        - If no declared domain matches the request Host, fall back to pure path matching
+          (original behavior for stt_custom, llm, etc.).
+        """
+        host = request.headers.get("host", "")
+        
+        # Step 1: Does this request's Host match any backend that declares domains?
+        request_matches_some_domain = any(
+            b.domain and b.matches_domain(host) for b in self.backends.values()
+        )
+        
+        for b in self.backends.values():
+            domain_ok = True
+            if b.domain:
+                # Backend declares domains → must match the request Host
+                domain_ok = b.matches_domain(host)
+            else:
+                # Backend has NO domain declared (pure path backend like stt_custom)
+                if request_matches_some_domain:
+                    # A domain was specified in the request → skip pure path backends
+                    domain_ok = False
+            
+            path_ok = b.matches_path(path)
+            if domain_ok and path_ok:
+                return b
+        return None
+
     async def _handle_request(self, request: Request, path: str) -> Response:
         full_path = f"/{path}"
         start_time = time.time()
 
-        # 1. Find matching backend by path
-        backend: Optional[Backend] = None
-        for b in self.backends.values():
-            if b.matches_path(full_path):
-                backend = b
-                break
+        # 1. Find matching backend by domain (if declared) + path.
+        #    - If backend declares `domain:`, the Host header must match one of its patterns
+        #      AND the path must match one of its path patterns.
+        #    - If backend has no `domain:` (empty), only path matching is required (legacy behavior).
+        #    This design allows multiple backends to share the same domain name but serve
+        #    different paths (e.g. api.example.com/v1/chat vs api.example.com/v1/embed).
+        backend: Optional[Backend] = self._find_backend(request, full_path)
 
         if not backend:
-            logger.warning(f"No backend matched path: {full_path} → returning 404 from EXRouter")
+            logger.warning(
+                f"No backend matched host+path for Host={request.headers.get('host', '-')} path={full_path} "
+                f"→ returning 404 from EXRouter"
+            )
             return Response(status_code=404, content=f"Unknown path: {full_path}")
 
         # 2. NEW: Run request remapper (if configured) BEFORE acquiring locks
@@ -348,6 +389,37 @@ class LockProxy:
                 if k.lower() not in hop_by_hop
             }
 
+            # === Proper reverse proxy headers (X-Forwarded-*) ===
+            # These are important for backends that log client info, do rate limiting,
+            # virtual hosting internally, or need to know original request context.
+            client_ip = request.client.host if request.client else "unknown"
+
+            # X-Forwarded-For: append client IP (preserve chain if already present)
+            existing_xff = filtered_headers.get("x-forwarded-for", "")
+            if existing_xff:
+                filtered_headers["x-forwarded-for"] = f"{existing_xff}, {client_ip}"
+            else:
+                filtered_headers["x-forwarded-for"] = client_ip
+
+            # X-Forwarded-Host: original Host header from client
+            original_host = request.headers.get("host", "")
+            if original_host:
+                filtered_headers["x-forwarded-host"] = original_host
+
+            # X-Forwarded-Proto: scheme (https/http). Prefer any already-forwarded value.
+            proto = request.headers.get("x-forwarded-proto") or getattr(request.url, "scheme", "http")
+            filtered_headers["x-forwarded-proto"] = proto
+
+            # X-Real-IP: common convention for the immediate client IP
+            filtered_headers["x-real-ip"] = client_ip
+
+            # Prevent backends from returning compressed responses (gzip/deflate/br).
+            # httpx auto-decompresses when it sees Content-Encoding, but then we were
+            # forwarding the original Content-Encoding + Content-Length, causing
+            # "Failed to uncompress gzip stream" (wget) and h11 Content-Length errors.
+            # Forcing "identity" makes backends send plain text (or we strip it anyway).
+            filtered_headers["accept-encoding"] = "identity"
+
             req = self.httpx_client.build_request(
                 method=request.method,
                 url=target_url,
@@ -418,10 +490,21 @@ class LockProxy:
                     headers=dict(response.headers)
                 )
             else:
+                # Clean hop-by-hop and length-related headers from backend so Starlette
+                # can set correct Content-Length based on the body we actually return.
+                # This prevents "Too much data for declared Content-Length" errors
+                # with some backends (especially modern web UIs).
+                clean_response_headers = {
+                    k: v for k, v in response.headers.items()
+                    if k.lower() not in {
+                        "content-length", "transfer-encoding", "content-encoding",
+                        "connection", "keep-alive"
+                    }
+                }
                 return Response(
                     status_code=status_code,
                     content=response_body,
-                    headers=dict(response.headers)
+                    headers=clean_response_headers
                 )
 
         except httpx.TimeoutException as e:

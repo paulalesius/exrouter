@@ -1,6 +1,6 @@
 [project]
 name = "exrouter"
-version = "0.0.2"
+version = "0.0.3"
 description = "Exclusive Router - declarative backend proxy with global locking. Routes requests to backends and manages cross-backend resource locks."
 readme = "README.md"
 requires-python = ">=3.12"

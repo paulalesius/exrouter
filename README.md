@@ -12,7 +12,7 @@ EXRouter solves the common problem of having **separate backends** for different
 
 Instead of requiring all models to be loaded simultaneously (quickly exhausting GPU memory), you declaratively specify which backends contend for resources. EXRouter then enforces exclusive access with proper re-entrancy, timeouts, and high concurrency for non-conflicting operations. Combined with lifecycle hooks, this pattern supports advanced setups such as on-demand model loading/unloading while maintaining a unified API.
 
-It supports advanced routing needs through **request remapping**, allowing you to expose TEI-style endpoints on top of `llama-server --embeddings`, rewrite paths, normalize request formats between different APIs, and more — all declaratively.
+It supports advanced routing needs through **request remapping** and **domain-based virtual hosting**, allowing you to expose TEI-style endpoints, rewrite paths, run multiple services on different subdomains through a single instance, and more — all declaratively, without requiring a fronting reverse proxy.
 
 ## Key Features
 
@@ -25,6 +25,7 @@ It supports advanced routing needs through **request remapping**, allowing you t
 - **Timeout Handling**: Configurable lock timeouts with `503 + Retry-After`
 - **Hop-by-Hop Header Filtering**: Proper HTTP proxy behavior
 - **Lifecycle Management**: Declarative `lifecycle:` blocks to manage a backend's own service (systemd, shell, wait_for). Automatically stops conflicting locked backends on activation. Backends with `locks:` stay running until another conflicting backend activates. Can be combined with custom Python hooks.
+- **Domain-based Routing & Virtual Hosting**: Optional `domain:` field (supports wildcards). EXRouter can now function as a lightweight reverse proxy / virtual host router without needing Caddy, Nginx or Traefik in front. When a request's `Host` header matches any declared domain, only domain-declaring backends are considered. Multiple backends can share the same domain but serve different paths. Pure path-based backends are automatically skipped in domain-matched requests. Proper `X-Forwarded-*` headers and compression handling are included.
 - **Error Propagation**: Backend HTTP status codes are forwarded correctly
 
 ## Architecture
@@ -102,6 +103,56 @@ Each backend specifies:
 - `locks`: List of other backend names to **exclusively lock** while processing this backend's requests. This is the mechanism for declaring VRAM/resource contention between backends.
 - `script` (optional): Path to Python hook script for lifecycle callbacks (e.g. dynamic model load/unload)
 - `remapper` (optional): Path to Python request remapper script
+- `domain` (optional): List of domain / `Host` header patterns this backend handles (supports `fnmatch` wildcards like `*.example.com` or exact names). When present, **both** domain and path must match. If the incoming request's `Host` matches any backend's declared domain, only domain-declaring backends are eligible — pure path-based backends are skipped. This turns EXRouter into a capable reverse proxy / virtual host router.
+
+### Domain-based Routing & Virtual Hosting
+
+EXRouter now supports **domain-based backend matching**, allowing you to run multiple services on different subdomains (or the same domain with different paths) through a single EXRouter instance — without needing an extra reverse proxy (Caddy/Nginx/Traefik) in front.
+
+**How it works:**
+- Add `domain:` to a backend (string or list).
+- A request is routed to a backend only if **both** the `Host` header matches one of its domains **and** the path matches one of its `paths`.
+- If the request's `Host` matches any declared domain in the config, pure path-only backends (e.g. `stt_custom`) are automatically ignored.
+- Multiple backends can share the same domain but use different path patterns.
+- Use `paths: ["*"]` (recommended) or `paths: ["/"]` for backends that should own the entire domain/subdomain.
+
+**Example config with virtual hosting:**
+
+```yaml
+backends:
+  langfuse:
+    url: http://127.0.0.1:7509
+    domain: ["langfuse.unnsvc.org"]
+    paths: ["*"]                    # or ["/"]
+
+  open-webui:
+    url: http://127.0.0.1:9090
+    domain: ["openwebui.unnsvc.org"]
+    paths: ["*"]
+
+  hermes-dashboard:
+    url: http://127.0.0.1:9119
+    domain: ["dashboard.unnsvc.org"]
+    paths: ["*"]
+
+  # Traditional path-based backend (no domain) still works
+  stt_custom:
+    url: http://127.0.0.1:7301
+    paths: ["/transcribe"]
+    locks: [llm]
+    lifecycle:
+      on_activate:
+        systemd:
+          start: [stt-custom.target]
+```
+
+With this setup you can access:
+- `https://langfuse.unnsvc.org/` → Langfuse
+- `https://openwebui.unnsvc.org/` → Open WebUI
+- `https://dashboard.unnsvc.org/` → Hermes Dashboard
+- Direct `/transcribe` calls (via IP or non-matching host) → stt_custom
+
+EXRouter also sets proper reverse proxy headers (`X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-IP`) and handles compression transparently.
 
 ### Declarative Lifecycle Management
 
