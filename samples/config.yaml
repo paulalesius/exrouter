@@ -1,5 +1,6 @@
 server:
   host: 0.0.0.0
+  # For testing, set PORT on the EXRouter service
   port: 4002
 
 global_lock:

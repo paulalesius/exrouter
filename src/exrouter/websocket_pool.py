@@ -138,7 +138,7 @@ class WebSocketPool:
     ) -> None:
         """Release a WebSocket connection back to pool.
         
-        Decrements ref count. If 0, connection stays in pool for reuse.
+        Decrements ref count. If 0, closes connection (no longer reuse).
         """
         key = (backend_name, ws_url)
         
@@ -150,7 +150,13 @@ class WebSocketPool:
                     conn.last_used = asyncio.get_event_loop().time()
                     
                     if conn.active_users <= 0:
-                        logger.debug(f"Released WebSocket connection for {backend_name} (now idle)")
+                        # Close the connection when ref count reaches 0
+                        await self._close_connection(conn)
+                        # Remove from pool
+                        connections.pop(connections.index(conn))
+                        if not connections:
+                            self._pool.pop(key, None)
+                        logger.debug(f"Closed WebSocket connection for {backend_name} (ref count=0)")
                     
                     return
     
