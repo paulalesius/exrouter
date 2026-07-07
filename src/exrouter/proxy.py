@@ -446,11 +446,15 @@ class LockProxy:
 
             # Run response remapper
             if backend.remapper:
+                print(f"[PROXY] Response remapper exists for backend '{backend.name}'")
                 remapper_instance = self.remapper_loader.get_remapper(backend.name)
+                print(f"[PROXY] Remapper instance: {remapper_instance}")
                 if remapper_instance:
+                    print(f"[PROXY] Calling remap for response...")
                     result: Optional[RemapResult] = await self.remapper_loader.call_remap(
                         remapper_instance, hook_context
                     )
+                    print(f"[PROXY] Remap result: {result}")
                     if result:
                         content = result.content
                         if isinstance(content, str):
@@ -460,6 +464,8 @@ class LockProxy:
                             content=content or b"",
                             headers=result.response_headers or {}
                         )
+            else:
+                print(f"[PROXY] No remapper configured for backend '{backend.name}'")
 
             if backend.script:
                 await self.hook_loader.call_hook(
