@@ -20,6 +20,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatusCode
 
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 import httpx
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -171,6 +172,19 @@ class LockProxy:
         self.app = FastAPI(title="EXRouter")
         self.app.add_middleware(RequestLoggingMiddleware)
         self._setup_routes()
+
+    def _close_response_on_complete(self, response: httpx.Response):
+        """Background task to close httpx response after streaming completes.
+        
+        This ensures the underlying connection is returned to the pool.
+        Note: This is called in a sync context by BackgroundTask, so we use sync close.
+        """
+        try:
+            # httpx Response has both sync and async close methods
+            # In BackgroundTask context, we need to use the sync version
+            response.close()
+        except Exception as e:
+            logger.debug(f"Error closing response: {e}")
 
     def _setup_routes(self) -> None:
         @self.app.get("/health")
@@ -377,7 +391,9 @@ class LockProxy:
 
         # Increment in-flight count
         self.active_counts[backend.name] = self.active_counts.get(backend.name, 0) + 1
-
+        
+        response = None  # Track response for cleanup in finally block
+        
         try:
             # Call lifecycle hooks
             if backend.script:
@@ -486,7 +502,9 @@ class LockProxy:
                     self._stream_sse(response.aiter_lines(), backend.name),
                     status_code=status_code,
                     media_type="text/event-stream",
-                    headers=dict(response.headers)
+                    headers=dict(response.headers),
+                    # Ensure response is closed when stream ends
+                    background=BackgroundTask(self._close_response_on_complete, response)
                 )
             else:
                 clean_response_headers = {
@@ -513,6 +531,18 @@ class LockProxy:
             return Response(status_code=502, content=f"Backend {backend.name} error: {str(e)}")
 
         finally:
+            # Close httpx response if not streaming (streaming uses BackgroundTask)
+            if response is not None and hasattr(hook_context, 'response_headers') and hook_context.response_headers:
+                try:
+                    # Only close if not already consumed/streaming
+                    # For non-streaming responses, aread() was already called
+                    # For streaming, BackgroundTask will handle closing
+                    content_type_lower = hook_context.response_headers.get('content-type', '').lower()
+                    if 'text/event-stream' not in content_type_lower:
+                        response.close()
+                except Exception as e:
+                    logger.debug(f"Error closing response in finally: {e}")
+            
             if backend.script:
                 await self.hook_loader.call_hook(
                     self.hook_loader.get_hook(backend.name),
