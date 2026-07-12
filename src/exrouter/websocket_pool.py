@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 import websockets
 from websockets.typing import Subprotocol
-from websockets.client import WebSocketClientProtocol
+from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger("exrouter")
 
@@ -22,7 +22,7 @@ logger = logging.getLogger("exrouter")
 @dataclass
 class WebSocketConnection:
     """Cached WebSocket connection with metadata."""
-    ws: WebSocketClientProtocol
+    ws: ClientConnection
     created_at: float
     last_used: float
     active_users: int = 1  # ref count for concurrent usage
@@ -86,7 +86,7 @@ class WebSocketPool:
         backend_name: str,
         ws_url: str,
         additional_headers: dict
-    ) -> WebSocketClientProtocol:
+    ) -> ClientConnection:
         """Get a WebSocket connection from pool or create new one.
         
         Returns either:
@@ -99,7 +99,7 @@ class WebSocketPool:
             # Try to get existing connection
             connections = self._pool[key]
             for conn in connections:
-                if conn.active_users > 0 and not conn.ws.closed:
+                if conn.active_users > 0 and conn.ws.close_code is None:
                     conn.active_users += 1
                     conn.last_used = asyncio.get_event_loop().time()
                     self._reused_count += 1
@@ -134,7 +134,7 @@ class WebSocketPool:
         self,
         backend_name: str,
         ws_url: str,
-        ws: WebSocketClientProtocol
+        ws: ClientConnection
     ) -> None:
         """Release a WebSocket connection back to pool.
         
@@ -164,7 +164,7 @@ class WebSocketPool:
         self,
         backend_name: str,
         ws_url: str,
-        ws: WebSocketClientProtocol
+        ws: ClientConnection
     ) -> None:
         """Close and remove a WebSocket connection from pool."""
         key = (backend_name, ws_url)
@@ -182,7 +182,7 @@ class WebSocketPool:
     async def _close_connection(self, conn: WebSocketConnection) -> None:
         """Close a single WebSocket connection."""
         try:
-            if not conn.ws.closed:
+            if conn.ws.close_code is None:
                 await conn.ws.close()
                 self._closed_count += 1
                 logger.debug(f"Closed WebSocket connection (created={self._created_count}, closed={self._closed_count})")

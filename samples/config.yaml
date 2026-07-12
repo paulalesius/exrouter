@@ -140,3 +140,7 @@ backends:
       url: "http://127.0.0.1:7509"
       domain: ["langfuse.unnsvc.org"]
       paths: ["/"]
+    tmux-mobile:
+      url: "http://127.0.0.1:5173"
+      domain: ["tmux.unnsvc.org"]
+      paths: ["/"]

@@ -15,8 +15,8 @@ from urllib.parse import urlparse
 from typing import Optional
 
 import websockets
-from websockets.client import WebSocketClientProtocol
-from websockets.exceptions import ConnectionClosed, InvalidStatusCode
+from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosed
 
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
