@@ -74,6 +74,19 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
         logger.info(f"→ {request.method} {request.url.path} from {forwarded}")
 
+        # Debug: log request headers
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"  Request headers: {dict(request.headers)}")
+            try:
+                body = await request.body()
+                if body:
+                    logger.debug(f"  Request body length: {len(body)} bytes")
+                    # Log first 512 bytes of body for debugging
+                    body_preview = body[:512].decode("utf-8", errors="replace")
+                    logger.debug(f"  Request body preview: {body_preview!r}")
+            except Exception:
+                pass  # Body might be streaming
+
         response = await call_next(request)
 
         process_time = (time.time() - start_time) * 1000
@@ -81,6 +94,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             f"← {request.method} {request.url.path} "
             f"status={response.status_code} ({process_time:.0f}ms)"
         )
+
+        # Debug: log response headers
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"  Response headers: {dict(response.headers)}")
 
         return response
 
@@ -345,6 +362,8 @@ class LockProxy:
         acquired = True
         if lock_targets:
             logger.info(f"Acquiring locks {lock_targets} for backend '{backend.name}' (domain: {backend.domain_name})")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"  Lock targets: {lock_targets}")
             acquired = await domain.lock_manager.acquire(backend.name, lock_targets)
 
         if not acquired:
@@ -437,6 +456,12 @@ class LockProxy:
             filtered_headers["x-real-ip"] = client_ip
             filtered_headers["accept-encoding"] = "identity"
 
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"  Backend URL: {target_url}")
+                logger.debug(f"  Backend headers: {filtered_headers}")
+                body_len = len(hook_context.request_body or request_body or b"")
+                logger.debug(f"  Backend request body: {body_len} bytes")
+
             req = self.httpx_client.build_request(
                 method=request.method,
                 url=target_url,
@@ -456,21 +481,25 @@ class LockProxy:
             if "text/event-stream" not in content_type:
                 response_body = await response.aread()
                 hook_context.response_body = response_body
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"  Backend response: {status_code}, {len(response_body)} bytes, content-type={content_type}")
             else:
                 response_body = b""
                 hook_context.response_body = None
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"  Backend response: {status_code}, SSE stream, content-type={content_type}")
 
             # Run response remapper
             if backend.remapper:
-                print(f"[PROXY] Response remapper exists for backend '{backend.name}'")
+                logger.debug(f"Response remapper configured for backend '{backend.name}'")
                 remapper_instance = self.remapper_loader.get_remapper(backend.name)
-                print(f"[PROXY] Remapper instance: {remapper_instance}")
+                logger.debug(f"Remapper instance: {remapper_instance}")
                 if remapper_instance:
-                    print(f"[PROXY] Calling remap for response...")
+                    logger.debug("Calling remap for response...")
                     result: Optional[RemapResult] = await self.remapper_loader.call_remap(
                         remapper_instance, hook_context
                     )
-                    print(f"[PROXY] Remap result: {result}")
+                    logger.debug(f"Remap result: {result}")
                     if result:
                         content = result.content
                         if isinstance(content, str):
@@ -481,7 +510,7 @@ class LockProxy:
                             headers=result.response_headers or {}
                         )
             else:
-                print(f"[PROXY] No remapper configured for backend '{backend.name}'")
+                logger.debug(f"No remapper configured for backend '{backend.name}'")
 
             if backend.script:
                 await self.hook_loader.call_hook(

@@ -11,13 +11,21 @@ from .config import Config, ServerConfig
 from .proxy import LockProxy
 
 
-def setup_logging() -> None:
+def setup_logging(level: str = "info") -> None:
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
+    if not isinstance(numeric_level, int):
+        numeric_level = logging.INFO
+
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        level=numeric_level,
+        format="%(asctime)s [%(levelname)-5s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    logging.getLogger("exrouter").setLevel(logging.INFO)
+
+    # Propagate level to all exrouter sub-loggers
+    for name in ("exrouter", "exrouter.proxy", "exrouter.lifecycle",
+                 "exrouter.hooks", "exrouter.remapper"):
+        logging.getLogger(name).setLevel(numeric_level)
 
 
 def main():
@@ -25,11 +33,10 @@ def main():
     parser.add_argument("--config", "-c", default="config.yaml", help="Path to config file (required)")
     args = parser.parse_args()
 
-    if not args.config:
-        parser.error("--config is required")
+    log_level = os.environ.get("EXROUTER_LOG_LEVEL", "info")
 
     try:
-        setup_logging()
+        setup_logging(log_level)
         logger = logging.getLogger("exrouter")
 
         # Load config from file (server: section is optional)

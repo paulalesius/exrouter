@@ -36,17 +36,9 @@ backends:
         on_activate:
           systemd:
             start: [llama-server.service]
-          shell:
-            - |
-              echo "Example on_activate script too"
         on_deactivate:
           systemd:
             stop: [llama-server.service]
-        wait_for:
-          - type: port
-            host: 127.0.0.1
-            port: 8080
-            timeout: 20
 
     # stt_custom is a custom endpoint that takes a POST
     # request to /transcribe and returns the result. It locks
