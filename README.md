@@ -85,7 +85,6 @@ All configuration is done through YAML.
 
 ```yaml
 global_lock:
-  enabled: true
   timeout: 300
 
 # Top-level "backends" key contains LOCK DOMAINS
@@ -339,7 +338,6 @@ class BackendHook:
 
 ### Global Lock Settings
 
-- `enabled`: Whether locking is active
 - `timeout`: Seconds to wait for locks (returns 503 if exceeded)
 
 ## How Locking Works

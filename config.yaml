@@ -40,7 +40,5 @@ backends:
 
 # Global lock settings
 global_lock:
-  # Enable global locking (set to false to disable)
-  enabled: true
   # Lock timeout in seconds (used for waiting)
   timeout: 300

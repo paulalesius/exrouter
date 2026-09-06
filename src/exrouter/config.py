@@ -141,7 +141,6 @@ class LockDomain(BaseModel):
 
 class GlobalLockConfig(BaseModel):
     """Global lock settings."""
-    enabled: bool = Field(default=True, description="Enable global locking")
     timeout: int = Field(default=300, gt=0, description="Timeout in seconds when waiting for locks")
 
 

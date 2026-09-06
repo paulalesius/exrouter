@@ -1,5 +1,4 @@
 global_lock:
-  enabled: true
   timeout: 300
 
 backends:
