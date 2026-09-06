@@ -5,38 +5,42 @@ server:
   host: 0.0.0.0
   port: 4001
 
-# Define backends with their paths and lock dependencies
+# Define backends with their paths and lock dependencies.
+# The top-level "backends" key contains LOCK DOMAINS (YAML hierarchy
+# level); each lock domain contains the backends that can lock each
+# other. See the README, "Config Structure".
 backends:
-  # LLM backend - handles chat/completions
-  llm:
-    url: http://localhost:8080
-    remapper: /src/exrouter/samples/llm-responses-remapper.py
-    paths:
-      - /v1/chat/completions
-      - /v1/completions
-      - /v1/models
-      - /v1/models/*
-    # Lock vision and embed while processing LLM requests
-    locks:
-      - vision
-      - embed
+  compute:
+    # LLM backend - handles chat/completions
+    llm:
+      url: http://localhost:8080
+      remapper: /src/exrouter/samples/llm-think-strip-remapper.py
+      paths:
+        - /v1/chat/completions
+        - /v1/completions
+        - /v1/models
+        - /v1/models/*
+      # Lock vision and embed while processing LLM requests
+      locks:
+        - vision
+        - embed
 
-  # Vision backend - handles image analysis
-  vision:
-    url: http://localhost:8081
-    paths:
-      - /v1/vision/*
-    # No locks - vision doesn't lock other backends
-    locks: []
+    # Vision backend - handles image analysis
+    vision:
+      url: http://localhost:8081
+      paths:
+        - /v1/vision/*
+      # No locks - vision doesn't lock other backends
+      locks: []
 
-  # Embeddings backend - handles vector embeddings
-  embed:
-    url: http://localhost:8081
-    paths:
-      - /v1/embeddings
-    # Lock LLM while processing embeddings
-    locks:
-      - llm
+    # Embeddings backend - handles vector embeddings
+    embed:
+      url: http://localhost:8081
+      paths:
+        - /v1/embeddings
+      # Lock LLM while processing embeddings
+      locks:
+        - llm
 
 # Global lock settings
 global_lock:
