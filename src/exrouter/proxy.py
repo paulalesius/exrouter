@@ -20,7 +20,6 @@ from websockets.exceptions import ConnectionClosed
 
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
-from starlette.background import BackgroundTask
 import httpx
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -189,19 +188,6 @@ class LockProxy:
         self.app = FastAPI(title="EXRouter")
         self.app.add_middleware(RequestLoggingMiddleware)
         self._setup_routes()
-
-    def _close_response_on_complete(self, response: httpx.Response):
-        """Background task to close httpx response after streaming completes.
-        
-        This ensures the underlying connection is returned to the pool.
-        Note: This is called in a sync context by BackgroundTask, so we use sync close.
-        """
-        try:
-            # httpx Response has both sync and async close methods
-            # In BackgroundTask context, we need to use the sync version
-            response.close()
-        except Exception as e:
-            logger.debug(f"Error closing response: {e}")
 
     def _setup_routes(self) -> None:
         @self.app.get("/health")
@@ -412,7 +398,8 @@ class LockProxy:
         self.active_counts[backend.name] = self.active_counts.get(backend.name, 0) + 1
         
         response = None  # Track response for cleanup in finally block
-        
+        streaming = False  # True once an SSE response is returned: cleanup moves to the stream wrapper
+
         try:
             # Call lifecycle hooks
             if backend.script:
@@ -527,14 +514,26 @@ class LockProxy:
                 logger.info(f"Backend '{backend.name}' responded {status_code} for {full_path} (took {elapsed:.3f}s)")
 
             if "text/event-stream" in content_type:
-                return StreamingResponse(
-                    self._stream_sse(response.aiter_lines(), backend.name),
+                # Locks must be held for the entire duration of the stream.
+                # The cleanup cannot run in this function's finally (which fires
+                # before the first streamed byte reaches the client); instead it
+                # runs in the stream wrapper's finally, when the stream is fully
+                # delivered, the client disconnects, or the stream raises.
+                sse_response = StreamingResponse(
+                    self._stream_with_cleanup(
+                        self._stream_sse(response.aiter_lines(), backend.name),
+                        domain,
+                        backend,
+                        lock_targets,
+                        hook_context,
+                        response,
+                    ),
                     status_code=status_code,
                     media_type="text/event-stream",
                     headers=dict(response.headers),
-                    # Ensure response is closed when stream ends
-                    background=BackgroundTask(self._close_response_on_complete, response)
                 )
+                streaming = True
+                return sse_response
             else:
                 clean_response_headers = {
                     k: v for k, v in response.headers.items()
@@ -560,40 +559,81 @@ class LockProxy:
             return Response(status_code=502, content=f"Backend {backend.name} error: {str(e)}")
 
         finally:
-            # Close httpx response if not streaming (streaming uses BackgroundTask)
-            if response is not None and hasattr(hook_context, 'response_headers') and hook_context.response_headers:
+            # For streaming responses the cleanup is deferred to the stream
+            # wrapper (_stream_with_cleanup) so locks are held until the stream
+            # is fully delivered. For everything else it runs here, as before.
+            if not streaming:
+                await self._finalize_request(domain, backend, lock_targets, hook_context, response)
+
+    async def _finalize_request(
+        self,
+        domain: LockDomain,
+        backend: Backend,
+        lock_targets: list[str],
+        hook_context: HookContext,
+        response: Optional[httpx.Response] = None,
+    ) -> None:
+        """Release locks, decrement the in-flight count, run post-request hooks.
+
+        Must only run once the request has *completed*: immediately for
+        buffered responses, and after the SSE stream has been fully delivered
+        (or the client went away) for streaming responses. Holding the locks
+        for the entire response duration is the core VRAM-exclusivity guarantee.
+        """
+        if response is not None and hook_context.response_headers:
+            try:
+                # Only close if not already consumed/streaming
+                # (streaming responses are closed by _stream_with_cleanup)
+                content_type_lower = hook_context.response_headers.get('content-type', '').lower()
+                if 'text/event-stream' not in content_type_lower:
+                    response.close()
+            except Exception as e:
+                logger.debug(f"Error closing response in finally: {e}")
+
+        if backend.script:
+            await self.hook_loader.call_hook(
+                self.hook_loader.get_hook(backend.name),
+                "on_after_request",
+                hook_context
+            )
+
+        if lock_targets:
+            await domain.lock_manager.release(backend.name, lock_targets)
+            logger.info(f"Released locks {lock_targets} for backend '{backend.name}'")
+
+        if backend.script:
+            await self.hook_loader.call_hook(
+                self.hook_loader.get_hook(backend.name),
+                "on_locks_released",
+                hook_context
+            )
+
+        self.active_counts[backend.name] = max(0, self.active_counts.get(backend.name, 1) - 1)
+        if self.active_counts[backend.name] <= 0:
+            self.active_counts[backend.name] = 0
+            await domain.lock_manager.release(backend.name, [backend.name])
+
+    async def _stream_with_cleanup(self, aiter, domain: LockDomain, backend: Backend,
+                                   lock_targets: list[str], hook_context: HookContext,
+                                   response: Optional[httpx.Response]):
+        """Wrap an SSE stream so locks are held until the stream is consumed.
+
+        The finally block runs when the stream completes normally, when the
+        consumer stops early (client disconnect), or when the stream raises.
+        In every case the locks are released, the in-flight count is
+        decremented, post-request hooks fire, and the backend response is
+        closed so its connection returns to the pool.
+        """
+        try:
+            async for line in aiter:
+                yield line
+        finally:
+            await self._finalize_request(domain, backend, lock_targets, hook_context)
+            if response is not None:
                 try:
-                    # Only close if not already consumed/streaming
-                    # For non-streaming responses, aread() was already called
-                    # For streaming, BackgroundTask will handle closing
-                    content_type_lower = hook_context.response_headers.get('content-type', '').lower()
-                    if 'text/event-stream' not in content_type_lower:
-                        response.close()
+                    response.close()
                 except Exception as e:
-                    logger.debug(f"Error closing response in finally: {e}")
-            
-            if backend.script:
-                await self.hook_loader.call_hook(
-                    self.hook_loader.get_hook(backend.name),
-                    "on_after_request",
-                    hook_context
-                )
-
-            if lock_targets:
-                await domain.lock_manager.release(backend.name, lock_targets)
-                logger.info(f"Released locks {lock_targets} for backend '{backend.name}'")
-
-            if backend.script:
-                await self.hook_loader.call_hook(
-                    self.hook_loader.get_hook(backend.name),
-                    "on_locks_released",
-                    hook_context
-                )
-
-            self.active_counts[backend.name] = max(0, self.active_counts.get(backend.name, 1) - 1)
-            if self.active_counts[backend.name] <= 0:
-                self.active_counts[backend.name] = 0
-                await domain.lock_manager.release(backend.name, [backend.name])
+                    logger.debug(f"Error closing streaming response: {e}")
 
     async def _handle_websocket(self, websocket: WebSocket, path: str) -> None:
         full_path = f"/{path}"

@@ -31,7 +31,7 @@ backends:
 
   # Embeddings backend - handles vector embeddings
   embed:
-    url: http://localhost:8082
+    url: http://localhost:8081
     paths:
       - /v1/embeddings
     # Lock LLM while processing embeddings

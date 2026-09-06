@@ -6,7 +6,7 @@ from exrouter.remapper import RequestRemapper, RemapResult
 from exrouter.hooks import HookContext
 
 # Reuse httpx client (already available as dependency)
-_client = httpx.AsyncClient(timeout=30.0)
+_client = httpx.AsyncClient(timeout=600.0)
 
 
 class RequestRemapper:
