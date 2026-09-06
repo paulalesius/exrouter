@@ -15,6 +15,10 @@ can be asserted while an SSE stream is mid-flight, and verify:
    after the response is produced (regression guard).
 4. While a backend's stream is in flight, a request to the backend it
    locks gets a 503 (exclusivity), and succeeds after the stream ends.
+5. A response whose remapper short-circuits an SSE stream closes the
+   backend stream (the remap path never builds the streaming wrapper
+   that would otherwise close it: without the explicit close the
+   backend connection leaks from the httpx pool).
 """
 
 import asyncio
@@ -26,6 +30,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from exrouter.config import Config
 from exrouter.proxy import LockProxy
+from exrouter.remapper import RemapResult
 
 
 SSE_LINES = [
@@ -246,3 +251,41 @@ async def test_locked_backend_gets_503_while_stream_in_flight(proxy):
     assert isinstance(ok, Response)
     assert ok.status_code == 200
     assert ok.body == b'{"embeddings": [[0.1, 0.2]]}'
+
+
+async def test_remapped_sse_response_closes_backend_stream(proxy):
+    """A remapper that short-circuits an SSE response must close the backend
+    stream. The remap path returns a plain Response (no streaming wrapper)
+    and _finalize_request skips closing text/event-stream responses (it
+    assumes the streaming wrapper owns them), so without the explicit close
+    every remapped SSE request leaks a backend connection from the httpx
+    pool."""
+
+    class RemapSSE:
+        def remap(self, context):
+            if context.response_status is None:
+                return None  # request phase: forward as usual
+            return RemapResult(
+                status_code=200,
+                content='{"remapped": true}',
+                response_headers={"content-type": "application/json"},
+            )
+
+    proxy.backends["llm"].remapper = "fake-remapper"
+    proxy.remapper_loader._remappers["llm"] = RemapSSE()
+
+    request = make_request("POST", "/v1/chat/completions", b'{"stream": true}')
+    response = await proxy._handle_request(request, "v1/chat/completions")
+
+    assert isinstance(response, Response)
+    assert response.status_code == 200
+    assert response.body == b'{"remapped": true}'
+
+    # The discarded SSE stream must be closed (connection returned to the pool).
+    assert proxy.httpx_client.sse_response.closed is True
+
+    # Locks and the in-flight count are still finalized as usual.
+    lm = proxy.domains["compute"].lock_manager
+    assert lm.is_locked("embed") is False
+    assert lm.is_locked("llm") is False
+    assert proxy.active_counts["llm"] == 0

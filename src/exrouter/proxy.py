@@ -479,6 +479,20 @@ class LockProxy:
                     )
                     logger.debug(f"Remap result: {result}")
                     if result:
+                        # The remap result fully replaces the backend
+                        # response, which is never streamed to the client:
+                        # close it now so its connection returns to the
+                        # pool. This is the only close for a remapped SSE
+                        # response: the finally below calls
+                        # _finalize_request, which skips text/event-stream
+                        # responses (it assumes the streaming wrapper owns
+                        # them), but this path never builds that wrapper.
+                        # Without this, every remapped SSE request leaks a
+                        # backend connection until the pool is exhausted.
+                        try:
+                            response.close()
+                        except Exception as e:
+                            logger.debug(f"Error closing remapped response: {e}")
                         content = result.content
                         if isinstance(content, str):
                             content = content.encode("utf-8")
