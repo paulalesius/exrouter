@@ -1,19 +1,59 @@
-"""TEI-compatible remapper for llama-server (fixed - uses httpx only)"""
+"""TEI-compatible remapper for llama-server.
+
+llama-server speaks OpenAI's /v1/embeddings API, but TEI clients expect
+/v1/info, /v1/models, and a bare list of vectors from /v1/embed.
+
+This remapper never calls the GPU itself. remap() runs before the proxy
+acquires locks, so a direct HTTP call from here would bypass the lock
+system entirely: an in-flight embedding would hold no locks and the
+other GPU backends could run at the same time. Instead:
+
+- /v1/info and /v1/models are answered statically (no GPU involved).
+- Embedding requests are rewritten (TEI "inputs" -> OpenAI "input",
+  path -> the backend's /v1/embeddings) and forwarded by the proxy
+  under the backend's locks, like any other request.
+- In the response phase the OpenAI answer is unwrapped back into a bare
+  vector list for clients that asked for TEI format. That is marked
+  with the x-exrouter-embed-format request header, which the proxy
+  keeps in HookContext.request_headers across both phases (and forwards
+  to the backend harmlessly).
+"""
 
 import json
-import httpx
-from exrouter.remapper import RequestRemapper, RemapResult
-from exrouter.hooks import HookContext
 
-# Reuse httpx client (already available as dependency)
-_client = httpx.AsyncClient(timeout=600.0)
+from exrouter.hooks import HookContext
+from exrouter.remapper import RemapResult, RequestRemapper
+
+EMBED_PATHS = ("/v1/embed", "/embed", "/v1/embeddings", "/embeddings")
+TEI_FORMAT_HEADER = "x-exrouter-embed-format"
 
 
 class RequestRemapper:
     async def remap(self, context: HookContext) -> RemapResult | None:
+        # Response phase: the backend answer is available. Unwrap it into
+        # a bare TEI vector list when the client asked for TEI format.
+        if context.response_body is not None:
+            if (
+                context.response_status != 200
+                or context.request_headers.get(TEI_FORMAT_HEADER) != "tei"
+            ):
+                # OpenAI-format client or backend error: pass through.
+                return None
+            try:
+                payload = json.loads(context.response_body)
+                embeddings = [item["embedding"] for item in payload.get("data", [])]
+            except (AttributeError, KeyError, TypeError, ValueError):
+                # Unexpected payload: pass through untouched.
+                return None
+            return RemapResult(
+                status_code=200,
+                content=json.dumps(embeddings).encode(),
+                response_headers={"content-type": "application/json"},
+            )
+
         path = context.request_path.lower()
 
-        # === /v1/info ===
+        # /v1/info (static, no GPU)
         if path == "/v1/info":
             info = {
                 "model_id": "bge-m3",
@@ -24,73 +64,37 @@ class RequestRemapper:
             return RemapResult(
                 status_code=200,
                 content=json.dumps(info).encode(),
-                response_headers={"content-type": "application/json"}
+                response_headers={"content-type": "application/json"},
             )
 
-        # === /v1/models ===
+        # /v1/models (static, no GPU)
         if path in ("/v1/models", "/models"):
             return RemapResult(
                 status_code=200,
                 content=json.dumps({
                     "object": "list",
-                    "data": [{"id": "bge-m3", "object": "model"}]
+                    "data": [{"id": "bge-m3", "object": "model"}],
                 }).encode(),
-                response_headers={"content-type": "application/json"}
+                response_headers={"content-type": "application/json"},
             )
 
-        # === Handle embedding requests (TEI style) ===
-        if path in ("/v1/embed", "/embed", "/v1/embeddings", "/embeddings"):
+        # Embedding requests: translate and let the proxy forward under lock.
+        if path in EMBED_PATHS:
             if not context.request_body:
                 return RemapResult(status_code=400, content=b"Empty body")
-
             try:
                 data = json.loads(context.request_body)
+            except ValueError:
+                return RemapResult(status_code=400, content=b"Invalid JSON body")
 
-                # Convert TEI-style "inputs" to OpenAI-style "input"
-                if "inputs" in data and "input" not in data:
-                    data["input"] = data.pop("inputs")
+            wants_tei = path in ("/v1/embed", "/embed") or "inputs" in data
+            if "inputs" in data and "input" not in data:
+                data["input"] = data.pop("inputs")
 
-                print(f"[REMAPPER] Handling embedding request on {path}")
-
-                # Call llama-server using httpx (already installed)
-                resp = await _client.post(
-                    "http://127.0.0.1:8081/v1/embeddings",
-                    json=data
-                )
-                resp.raise_for_status()
-                openai_resp = resp.json()
-
-                # Detect if client wants raw TEI format or OpenAI format
-                # Raw TEI format: /v1/embed or /embed paths typically expect list response
-                # OpenAI format: /v1/embeddings or /embeddings paths expect {"data": [...]}
-                # Also check if request used "inputs" (TEI) vs "input" (OpenAI)
-                # Note: data dict already has "inputs" converted to "input" if present
-                # Check original body for "inputs" key before conversion
-                original_body = json.loads(context.request_body) if isinstance(context.request_body, str) else json.loads(context.request_body.decode('utf-8'))
-                wants_raw_tei = (
-                    path in ("/v1/embed", "/embed") or
-                    "inputs" in original_body
-                )
-
-                if wants_raw_tei:
-                    # Return raw TEI format: list of embedding vectors
-                    embeddings = [item["embedding"] for item in openai_resp.get("data", [])]
-                    return RemapResult(
-                        status_code=200,
-                        content=json.dumps(embeddings).encode(),
-                        response_headers={"content-type": "application/json"}
-                    )
-                else:
-                    # Return OpenAI-compatible format: {"data": [{"embedding": [...], "index": 0, ...}]}
-                    # Used by Open WebUI, LangChain, and other OpenAI-compatible clients
-                    return RemapResult(
-                        status_code=200,
-                        content=json.dumps(openai_resp).encode(),
-                        response_headers={"content-type": "application/json"}
-                    )
-
-            except Exception as e:
-                print(f"[REMAPPER] Embedding error: {e}")
-                return RemapResult(status_code=502, content=str(e).encode())
+            return RemapResult(
+                path="/v1/embeddings",
+                body=json.dumps(data).encode(),
+                headers={TEI_FORMAT_HEADER: "tei"} if wants_tei else None,
+            )
 
         return None

@@ -4,6 +4,12 @@ This is especially useful when:
 - Clients expect TEI-compatible endpoints (/v1/info, etc.) that the real server doesn't implement.
 - You want to rewrite paths or route to a different backend dynamically.
 - You need to return synthetic responses for certain paths.
+
+Note: remap() runs BEFORE the proxy acquires locks. Never perform direct
+backend I/O from a remapper: it would bypass the lock system and let the
+other backends share the GPU mid-request. Either rewrite the request
+(path, body, headers) and let the proxy forward it under lock, or
+short-circuit with a static response that needs no GPU.
 """
 
 from dataclasses import dataclass
