@@ -21,21 +21,28 @@ class SystemdConfig(BaseModel):
 
 
 class ActionSet(BaseModel):
-    """Set of actions to run on activate or deactivate."""
+    """Set of actions to run on an activate or deactivate phase.
+
+    systemd, shell and python are interchangeable choices for the same job:
+    declare any combination per phase and the executor runs them in the fixed
+    order systemd -> shell -> python -> wait_for.
+    """
     systemd: Optional[SystemdConfig] = Field(default=None, description="Systemd start/stop actions")
-    shell: list[str] = Field(default_factory=list, description="Shell commands to execute (each via bash -c)")
+    shell: list[str] = Field(default_factory=list, description="Shell commands to execute (each via /bin/sh -c)")
+    python: Optional[str] = Field(default=None, description="Path to a Python script for this phase. Must define a callable named after the phase: activate() or deactivate() (sync or async)")
     wait_for: list[WaitForConfig] = Field(default_factory=list, description="Wait conditions after actions (usually on activate)")
 
 
 class LifecycleConfig(BaseModel):
-    """Declarative lifecycle management (systemd/shell/wait) as alternative to hook scripts.
+    """The single activation/deactivation mechanism for a backend's own service.
 
-    Runs on backend activation (first in-flight request after idle) and deactivation
-    (last in-flight request completes). This is ideal for VRAM/resource management
-    without writing Python hook code.
+    on_activate runs the first time a request reaches the backend after it was
+    deactivated; on_deactivate runs when another backend that locks this one
+    activates and stops it. Ideal for VRAM/resource management: start and stop
+    services with systemd units, shell commands, or Python scripts.
     """
-    on_activate: Optional[ActionSet] = Field(default=None, description="Actions when this backend becomes active")
-    on_deactivate: Optional[ActionSet] = Field(default=None, description="Actions when this backend becomes idle")
+    on_activate: Optional[ActionSet] = Field(default=None, description="Actions when this backend activates")
+    on_deactivate: Optional[ActionSet] = Field(default=None, description="Actions when this backend is deactivated by a conflicting backend")
 
 
 class BackendConfig(BaseModel):
@@ -57,12 +64,12 @@ class BackendConfig(BaseModel):
                     "If specified, BOTH domain and path must match. "
                     "Combine with paths: ['*'] or paths: ['/'] to give one backend full ownership of that domain."
     )
-    script: Optional[str] = Field(default=None, description="Path to Python hook script")
+    script: Optional[str] = Field(default=None, description="Path to Python hook script for request-level callbacks (not activation/deactivation: that is lifecycle:)")
     remapper: Optional[str] = Field(default=None, description="Path to Python request remapper script")
     lifecycle: Optional[LifecycleConfig] = Field(
         default=None,
-        description="Declarative lifecycle actions (systemd + shell + wait_for) on activate/deactivate. "
-                    "Alternative to writing a full hook script for common resource management use cases."
+        description="The single activation/deactivation mechanism for this backend's own service. "
+                    "Per phase: systemd units, shell commands, Python scripts, and wait conditions."
     )
 
     @field_validator('paths', 'locks', 'domain', mode='before')

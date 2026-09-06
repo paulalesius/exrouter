@@ -24,7 +24,7 @@ It supports advanced routing needs through **request remapping** and **domain-ba
 - **Streaming Support**: SSE and regular responses streamed without buffering
 - **Timeout Handling**: Configurable lock timeouts with `503 + Retry-After`
 - **Hop-by-Hop Header Filtering**: Proper HTTP proxy behavior
-- **Lifecycle Management**: Declarative `lifecycle:` blocks to manage a backend's own service (systemd, shell, wait_for). Automatically stops conflicting locked backends on activation. Backends with `locks:` stay running until another conflicting backend activates. Can be combined with custom Python hooks.
+- **Lifecycle Management**: Declarative `lifecycle:` blocks - the single mechanism for starting and stopping a backend's own service. Per phase you pick any combination of systemd units, shell commands, and Python scripts, plus wait conditions. Automatically stops conflicting locked backends on activation. Backends with `locks:` stay running until another conflicting backend activates.
 - **Domain-based Routing & Virtual Hosting**: Optional `domain:` field (supports wildcards). EXRouter can now function as a lightweight reverse proxy / virtual host router without needing Caddy, Nginx or Traefik in front. When a request's `Host` header matches any declared domain, only domain-declaring backends are considered. Multiple backends can share the same domain but serve different paths. Pure path-based backends are automatically skipped in domain-matched requests. Proper `X-Forwarded-*` headers and compression handling are included.
 - **WebSocket Proxy Support**: Automatic WebSocket upgrade handling with proper header forwarding
 - **Health & Config Endpoints**: Built-in `/health` and `/config` endpoints for monitoring
@@ -118,10 +118,10 @@ Each backend specifies:
 - `url`: Backend server URL (must be http/https)
 - `paths`: List of path patterns (supports wildcards like `/v1/vision/*`)
 - `locks`: List of other backend names to **exclusively lock** while processing. Must be in the same lock domain. This is the mechanism for declaring VRAM/resource contention.
-- `script` (optional): Path to Python hook script for lifecycle callbacks (e.g. dynamic model load/unload)
+- `script` (optional): Path to Python hook script for request-level callbacks (before/after request, locks acquired/released). Service start/stop does not belong here: that is `lifecycle:`
 - `remapper` (optional): Path to Python request remapper script
 - `domain` (optional): List of domain / `Host` header patterns this backend handles (supports `fnmatch` wildcards like `*.example.com` or exact names). When present, **both** domain and path must match. If the incoming request's `Host` matches any backend's declared domain, only domain-declaring backends are eligible — pure path-based backends are skipped. This turns EXRouter into a capable reverse proxy / virtual host router.
-- `lifecycle` (optional): Declarative lifecycle actions (systemd + shell + wait_for) on activate/deactivate
+- `lifecycle` (optional): The single activation/deactivation mechanism for this backend's own service. Per phase: systemd units, shell commands, Python scripts, and wait conditions in any combination
 
 ### Lock Domains
 
@@ -205,9 +205,16 @@ EXRouter also sets proper reverse proxy headers (`X-Forwarded-For`, `X-Forwarded
 
 ### Declarative Lifecycle Management
 
-EXRouter supports declarative lifecycle management via the `lifecycle:` key under each backend. This is the recommended way to start, stop, and wait for backend services (especially when using systemd).
+The `lifecycle:` key under each backend is the **single mechanism** for starting and stopping a backend's own service. For each phase (`on_activate` / `on_deactivate`) you configure any combination of the action types below - this is a user choice in the YAML config, not separate execution paths in the program:
 
-Example:
+- `systemd`: start/stop systemd units or targets
+- `shell`: shell commands (each run via `/bin/sh -c`)
+- `python`: a Python script (see below)
+- `wait_for`: readiness conditions (port checks), most useful after starting a service
+
+Actions within a phase run in the fixed order: systemd, shell, python, wait_for.
+
+Example (systemd + port wait):
 
 ```yaml
 backends:
@@ -230,6 +237,37 @@ backends:
             stop: [llama-server.service]
 ```
 
+Example (Python scripts as the start/stop mechanism):
+
+```yaml
+    llm:
+      url: http://127.0.0.1:8080
+      paths: [/v1/chat/completions]
+      locks: [stt]
+      lifecycle:
+        on_activate:
+          python: /opt/exrouter/hooks/llm_activate.py
+          wait_for:
+            - type: port
+              host: 127.0.0.1
+              port: 8080
+              timeout: 30
+        on_deactivate:
+          python: /opt/exrouter/hooks/llm_deactivate.py
+```
+
+A Python lifecycle script is a plain file that defines one callable named after the phase it is used in - `activate()` in an `on_activate` script, `deactivate()` in an `on_deactivate` script. Sync and async callables are both supported, and one file can serve both phases of a backend by defining both functions:
+
+```python
+# /opt/exrouter/hooks/llm_activate.py
+
+def activate():
+    # start your service however you like: subprocess, systemctl, sockets...
+    ...
+```
+
+Like shell and systemd actions, a failing Python script is logged and does not abort the request.
+
 **Important rules and behavior:**
 
 - The `on_activate` and `on_deactivate` actions defined for a backend are **only intended to manage that backend's own service**. Do **not** use them to manually start or stop *other* services. Doing so can cause race conditions and nasty locking issues.
@@ -237,7 +275,7 @@ backends:
 - Backends that declare `locks:` **stay running** once activated. They are **not** automatically stopped when their request count reaches zero. They only get stopped when another backend that conflicts with them activates.
 - This design gives you clean "mode switching" behavior between mutually exclusive heavy services (e.g. LLM ↔ Speech-to-Text) while keeping the previously active service warm.
 
-You can combine `lifecycle:` with custom Python hook scripts (`script:`) if you need more complex logic.
+If you need logic beyond what systemd units and shell commands express, use `python:` actions: Python scripts are a first-class lifecycle action type, not a separate execution path.
 
 ### Request Remappers
 
@@ -280,7 +318,9 @@ Remappers can:
 
 ### Hook Scripts
 
-Hook scripts allow custom code to run at specific points in the request lifecycle or backend lifecycle. This pairs powerfully with global locking for advanced VRAM management (e.g. starting/stopping backends or loading/unloading models on demand).
+Hook scripts allow custom code to run at specific points in the **request** lifecycle: when locks are acquired/released, before and after the request to the backend, and on the response. Service start/stop does not belong here: that is configured via `lifecycle:` (see Declarative Lifecycle Management above).
+
+Available request-level methods: `on_locks_acquired`, `on_before_request`, `on_response`, `on_after_request`, `on_locks_released`. All receive a `HookContext` and may be sync or async.
 
 Create a Python file that defines a `BackendHook` class:
 
@@ -288,13 +328,13 @@ Create a Python file that defines a `BackendHook` class:
 from exrouter.hooks import BackendHook, HookContext
 
 class BackendHook:
-    def on_backend_activated(self, context: HookContext) -> None:
-        print(f"Backend {context.backend_name} activated")
+    def on_before_request(self, context: HookContext) -> None:
+        # e.g. inject per-user headers, rewrite auth tokens, ...
+        pass
 
-    def on_backend_deactivated(self, context: HookContext) -> None:
-        print(f"Backend {context.backend_name} deactivated")
-
-    # Other lifecycle methods available...
+    def on_after_request(self, context: HookContext) -> None:
+        # e.g. log usage, record latency, ...
+        pass
 ```
 
 ### Global Lock Settings

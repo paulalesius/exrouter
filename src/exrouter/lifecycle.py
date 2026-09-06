@@ -1,16 +1,17 @@
-"""Declarative lifecycle actions executor (systemd, shell commands, wait conditions).
+"""Declarative lifecycle actions executor (systemd, shell commands, Python scripts, wait conditions).
 
-This provides a native, YAML-driven way to manage backend services (e.g. start/stop
-systemd units when a backend goes from idle → active or active → idle) without
-requiring users to write Python hook scripts for the common VRAM/resource switching
-pattern.
+The single execution path for backend activation and deactivation. Per phase the
+user declares any combination of systemd units, shell commands, and Python scripts
+in the YAML `lifecycle:` block; they are executed in the fixed order
+systemd -> shell -> python -> wait_for.
 
-It is executed at the same points as the existing hook on_backend_activated /
-on_backend_deactivated callbacks, and runs *in addition to* any hook script if both
-are configured.
+A Python script is a plain file that defines one callable named after the phase it
+is used in: activate() for on_activate, deactivate() for on_deactivate. Sync and
+async callables are both supported.
 """
 
 import asyncio
+import importlib.util
 import logging
 import time
 from typing import Optional
@@ -44,7 +45,11 @@ class LifecycleExecutor:
         for cmd in action_set.shell:
             await self._run_shell(cmd, backend_name)
 
-        # 3. Wait conditions (most useful after starting on activate)
+        # 3. Python script (first-class action type, same status as systemd/shell)
+        if action_set.python:
+            await self._run_python(action_set.python, phase, backend_name)
+
+        # 4. Wait conditions (most useful after starting on activate)
         for wait in action_set.wait_for:
             if wait.type == "port":
                 await self._wait_for_port(wait.host, wait.port, wait.timeout, backend_name)
@@ -95,6 +100,38 @@ class LifecycleExecutor:
             logger.warning(f"  ⚠ Timeout running shell command: {cmd[:80]}")
         except Exception as e:
             logger.error(f"  ✗ Error running shell '{cmd}': {e}")
+
+    async def _run_python(self, script_path: str, phase: str, backend_name: str) -> None:
+        """Import a user Python script and call its phase function.
+
+        The script must define a callable named after the phase: activate() for
+        the activate phase, deactivate() for the deactivate phase. Sync and async
+        callables are both supported. Failures are logged, not raised, consistent
+        with the shell and systemd actions: one bad script must not wedge the proxy.
+        """
+        logger.info(f"  [{backend_name}] python: {script_path} ({phase})")
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"exrouter_lifecycle_{backend_name}_{phase}", script_path
+            )
+            if spec is None or spec.loader is None:
+                logger.error(f"  ✗ Failed to load lifecycle script spec: {script_path}")
+                return
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            func = getattr(module, phase, None)
+            if not callable(func):
+                logger.error(
+                    f"  ✗ Lifecycle script {script_path} must define a callable "
+                    f"'{phase}()' (sync or async)"
+                )
+                return
+            result = func()
+            if asyncio.iscoroutine(result):
+                await result
+            logger.info(f"  ✓ python script succeeded")
+        except Exception as e:
+            logger.error(f"  ✗ Error running lifecycle script '{script_path}': {e}")
 
     async def _wait_for_port(
         self, host: str, port: int, timeout: int, backend_name: str

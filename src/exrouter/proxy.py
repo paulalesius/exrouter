@@ -366,13 +366,6 @@ class LockProxy:
         if backend.name not in self.activated_backends:
             self.activated_backends.add(backend.name)
 
-            if backend.script:
-                await self.hook_loader.call_hook(
-                    self.hook_loader.get_hook(backend.name),
-                    "on_backend_activated",
-                    hook_context
-                )
-
             # Self-lock within domain
             await domain.lock_manager.acquire(backend.name, [backend.name])
 
@@ -685,10 +678,6 @@ class LockProxy:
         if backend.name not in self.activated_backends:
             self.activated_backends.add(backend.name)
 
-            if backend.script:
-                await self.hook_loader.call_hook(
-                    self.hook_loader.get_hook(backend.name), "on_backend_activated", hook_context
-                )
             await domain.lock_manager.acquire(backend.name, [backend.name])
 
             for locked_name in lock_targets:

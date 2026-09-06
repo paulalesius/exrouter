@@ -51,26 +51,6 @@ class BackendHook:
         """Called after locks are released."""
         pass
 
-    def on_backend_activated(self, context: HookContext) -> Optional[dict]:
-        """Called when this backend transitions from idle to active 
-        (i.e. first request arrives after a period of no in-flight requests).
-        
-        Use this for expensive setup like starting systemd services,
-        loading models, or acquiring exclusive resources.
-        Subsequent requests to the same backend while it is active
-        will NOT trigger this again.
-        """
-        pass
-
-    def on_backend_deactivated(self, context: HookContext) -> Optional[dict]:
-        """Called when this backend transitions from active to idle
-        (i.e. the last in-flight request finishes).
-        
-        Use this for cleanup like stopping services to free resources (GPU/CPU/RAM)
-        when the backend is no longer needed.
-        """
-        pass
-
 
 class HookLoader:
     """Loads and manages hook scripts for backends."""
