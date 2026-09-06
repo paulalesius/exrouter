@@ -4,9 +4,11 @@ Design (nginx/Caddy model: one dedicated upstream leg per downstream client
 connection, no pooling):
 - Each concurrent client gets its own backend connection (no sharing,
   no cross-delivery).
-- WebSocket sessions do NOT take cross-backend locks (a parked chat tab
-  must not exclusive-lock the rest of the domain for hours).
-- WebSocket sessions DO take the self-lock + activation path.
+- WebSocket sessions do NOT acquire or hold cross-backend locks for the
+  session lifetime (a parked chat tab must not block the rest of the
+  domain for hours), but they DO take the full activation path:
+  activating a WebSocket backend deactivates the backends it locks
+  (the same VRAM handoff as the HTTP path).
 - When a backend is deactivated, its open legs are closed and the client
   sees a clean disconnect.
 - When a session ends, the leg is closed and the self-lock released.
@@ -171,10 +173,12 @@ def make_request(method: str, path: str, body: bytes = b"{}") -> Request:
     return Request(scope, receive)
 
 
-async def open_session(proxy: LockProxy, tag: str = "c") -> tuple[FakeClientWS, asyncio.Task]:
+async def open_session(
+    proxy: LockProxy, tag: str = "c", path: str = "ws"
+) -> tuple[FakeClientWS, asyncio.Task]:
     """Start a WS session and wait until it echoes one message back."""
     fake = FakeClientWS(tag)
-    task = asyncio.create_task(proxy._handle_websocket(fake, "ws"))
+    task = asyncio.create_task(proxy._handle_websocket(fake, path))
     await fake.inbox.put(f"{tag}-ping")
     await wait_for(lambda: ("text", f"{tag}-ping") in fake.out)
     return fake, task
@@ -271,6 +275,56 @@ async def test_ws_self_lock_blocks_locking_http_backend(echo_server, tmp_path):
     assert ok.status_code == 502
     assert deact_marker.exists()
     assert "ws" not in proxy.activated_backends
+
+
+async def test_ws_activation_deactivates_locked_backend(echo_server, tmp_path):
+    """Opening a WS session must run the same VRAM handoff as the HTTP
+    path: the backends the session's backend locks are deactivated
+    (service stopped, dropped from activated_backends, open legs closed)
+    before the session's own backend is activated. Without this, the
+    session starts its service while a locked backend's service is still
+    running: both mutually exclusive services up at once."""
+    handoff = tmp_path / "handoff"
+    proxy = make_proxy(
+        echo_server,
+        extra_backends={
+            "other": {
+                "url": echo_server.url,
+                "paths": ["/other"],
+                "lifecycle": {
+                    "on_deactivate": {"shell": [f'echo other-off >> "{handoff}"']}
+                },
+            }
+        },
+        ws_locks=["other"],
+        ws_lifecycle={"on_activate": {"shell": [f'echo ws-on >> "{handoff}"']}},
+    )
+    lm = proxy.domains["d"].lock_manager
+
+    # "other" is up and in use: hold a session to it.
+    other_fake, other_task = await open_session(proxy, "o", path="other")
+    assert lm.is_locked("other") is True
+    assert "other" in proxy.activated_backends
+
+    # A WS session to the backend that locks "other" must stop it first.
+    fake, task = await open_session(proxy, "c")
+
+    assert handoff.read_text().split() == ["other-off", "ws-on"]
+    assert "other" not in proxy.activated_backends
+
+    # "other"'s open leg was closed: its session's backend side ends and
+    # the client is told to disconnect.
+    await wait_for(lambda: other_fake.closed)
+    await other_fake.inbox.put(DISCONNECT)  # unblock the client-side loop
+    await other_task
+    await wait_for(lambda: lm.is_locked("other") is False)
+
+    # Session ends: leg closed, self-lock released.
+    await fake.inbox.put(DISCONNECT)
+    await task
+    await wait_for(lambda: len(echo_server.closed) == 2)
+    assert proxy.active_counts["ws"] == 0
+    assert lm.is_locked("ws") is False
 
 
 async def test_deactivation_closes_open_ws_legs(echo_server):

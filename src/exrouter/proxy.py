@@ -375,28 +375,8 @@ class LockProxy:
             # Self-lock within domain
             await domain.lock_manager.acquire(backend.name, [backend.name])
 
-            # Stop backends this one locks
-            for locked_name in lock_targets:
-                locked_lifecycle = self.lifecycle_configs.get(locked_name)
-                if locked_lifecycle and locked_lifecycle.on_deactivate:
-                    logger.info(
-                        f"[{backend.name}] Stopping locked backend '{locked_name}' first"
-                    )
-                    await self.lifecycle_executor.execute(
-                        locked_name, locked_lifecycle.on_deactivate, is_activate=False
-                    )
-                    # locked_name's service was just stopped, so it must be
-                    # re-activated before the next request for it: remove it
-                    # from activated_backends so its activation block (and its
-                    # on_activate, which restarts the service) runs again.
-                    # Without this the VRAM handoff is one-way: a deactivated
-                    # backend could never be started again.
-                    self.activated_backends.discard(locked_name)
-                    # The service was just stopped: drop any open WebSocket
-                    # legs to it so clients see a clean disconnect (and
-                    # typically reconnect once it is re-activated) instead of
-                    # a connection hanging against a dead service.
-                    await self._close_backend_ws_legs(locked_name)
+            # Stop backends this one locks (VRAM handoff)
+            await self._deactivate_locked_backends(backend.name, lock_targets)
 
             # Activate self
             lifecycle = self.lifecycle_configs.get(backend.name)
@@ -667,6 +647,32 @@ class LockProxy:
             f"Closed {len(legs)} WebSocket leg(s) to deactivated backend '{backend_name}'"
         )
 
+    async def _deactivate_locked_backends(self, backend_name: str, lock_targets: list[str]) -> None:
+        """Deactivate the backends that ``backend_name`` locks (same domain).
+
+        Shared by the HTTP and WebSocket activation paths: before a
+        backend's own service is started, the services of the backends it
+        locks must be stopped (VRAM handoff). Each such target is dropped
+        from activated_backends so its next use re-runs the full activation
+        block (and its on_activate, which restarts the service): without
+        this the VRAM handoff is one-way and a deactivated backend could
+        never be started again. Open WebSocket legs to a stopped target are
+        closed so clients see a clean disconnect (and typically reconnect
+        once the backend is re-activated) instead of a connection hanging
+        against a dead service.
+        """
+        for locked_name in lock_targets:
+            locked_lifecycle = self.lifecycle_configs.get(locked_name)
+            if locked_lifecycle and locked_lifecycle.on_deactivate:
+                logger.info(
+                    f"[{backend_name}] Stopping locked backend '{locked_name}' first"
+                )
+                await self.lifecycle_executor.execute(
+                    locked_name, locked_lifecycle.on_deactivate, is_activate=False
+                )
+                self.activated_backends.discard(locked_name)
+                await self._close_backend_ws_legs(locked_name)
+
     async def _handle_websocket(self, websocket: WebSocket, path: str) -> None:
         full_path = f"/{path}"
         host = websocket.headers.get("host", "")
@@ -697,25 +703,28 @@ class LockProxy:
                     full_path = result.path
 
         # Locking policy for WebSocket sessions:
-        # - Cross-backend locks (locks:) are NEVER acquired for a WS session.
-        #   A WS session can stay open for hours (a parked chat tab, a phone
-        #   left on a TTS page); holding locks: for its lifetime would
-        #   exclusive-lock the rest of the domain the whole time. locks:
-        #   only applies to HTTP request/response (and SSE stream) lifetimes.
-        # - The self-lock + activation path IS taken, so on_activate runs and
-        #   the backend is marked in-use (its service is up and a client is
-        #   connected) for the duration of the session.
+        # - Cross-backend locks (locks:) are NEVER acquired or held for a WS
+        #   session. A WS session can stay open for hours (a parked chat tab,
+        #   a phone left on a TTS page); waiting on them at connect time or
+        #   holding them for the session lifetime would exclusive-lock the
+        #   rest of the domain the whole time.
+        # - The self-lock + activation path IS taken: the backend is marked
+        #   in-use (its service is up and a client is connected) for the
+        #   duration of the session, and activation includes the same VRAM
+        #   handoff as the HTTP path: the backends this one locks are
+        #   deactivated before its own service starts.
         domain = self.domains[backend.domain_name]
-        lock_targets = []  # WS sessions skip cross-backend locks
+        lock_targets = []  # WS sessions never acquire cross-backend locks
 
         if backend.locks and backend.name not in self._ws_lock_warned:
             self._ws_lock_warned.add(backend.name)
             logger.warning(
-                f"Backend '{backend.name}' declares locks: {backend.locks}, but "
-                f"WebSocket sessions never take cross-backend locks, so those "
-                f"locks do not apply to its WebSocket paths (its HTTP paths are "
-                f"unaffected). Remove locks: from this backend if it only serves "
-                f"WebSockets."
+                f"Backend '{backend.name}' declares locks: {backend.locks}. "
+                f"WebSocket sessions to this backend do not wait for those "
+                f"backends to become idle before connecting (the HTTP "
+                f"wait/503 gate does not apply to WebSocket upgrades); the "
+                f"locked backends are deactivated when this backend is "
+                f"activated instead."
             )
 
         if backend.name not in self.activated_backends:
@@ -724,6 +733,14 @@ class LockProxy:
             # Self-lock: marks the backend in-use while the session is open
             # (released in the finally block when the last session ends).
             await domain.lock_manager.acquire(backend.name, [backend.name])
+
+            # VRAM handoff, same as the HTTP activation path: stop the
+            # backends this one locks before its own service starts. (The
+            # session does not acquire or hold their locks for its lifetime;
+            # it only deactivates them here, at activation time.)
+            await self._deactivate_locked_backends(
+                backend.name, backend.get_lock_targets(domain.backends)
+            )
 
             lifecycle = self.lifecycle_configs.get(backend.name)
             if lifecycle and lifecycle.on_activate:
