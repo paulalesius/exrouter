@@ -15,8 +15,6 @@ from urllib.parse import urlparse
 from typing import Optional
 
 import websockets
-from websockets.asyncio.client import ClientConnection
-from websockets.exceptions import ConnectionClosed
 
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
@@ -31,7 +29,6 @@ from .domain import LockDomain
 from .hooks import HookLoader, HookContext
 from .lifecycle import LifecycleExecutor
 from .remapper import RemapperLoader, RemapResult
-from .websocket_pool import WebSocketPool
 
 logger = logging.getLogger("exrouter")
 
@@ -102,7 +99,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 
 class LockProxy:
-    """Main proxy server with connection pooling, locking, hooks, and request remapping.
+    """Main proxy server with HTTP connection pooling, WebSocket legs, locking, hooks, and request remapping.
     
     Architecture:
     - Multiple LockDomains, each with its own LockManager
@@ -181,9 +178,18 @@ class LockProxy:
             timeout=httpx.Timeout(300.0, connect=30.0)
         )
         
-        # WebSocket connection pool
-        self.ws_pool = WebSocketPool(max_idle_seconds=300, max_connections=100)
-        
+        # Open WebSocket legs to backends, by backend name. One dedicated leg
+        # per downstream client connection (nginx/Caddy style: no pooling).
+        # A WebSocket is a stateful bidirectional session, so a shared leg
+        # would misdeliver messages and an idle leg would hold backend
+        # resources needlessly. Legs are closed when the session ends or the
+        # backend is deactivated.
+        self.ws_legs: dict[str, set] = {}
+
+        # Backends for which we already warned that locks: does not apply to
+        # their WebSocket paths.
+        self._ws_lock_warned: set[str] = set()
+
         # Create FastAPI app
         self.app = FastAPI(title="EXRouter")
         self.app.add_middleware(RequestLoggingMiddleware)
@@ -386,6 +392,11 @@ class LockProxy:
                     # Without this the VRAM handoff is one-way: a deactivated
                     # backend could never be started again.
                     self.activated_backends.discard(locked_name)
+                    # The service was just stopped: drop any open WebSocket
+                    # legs to it so clients see a clean disconnect (and
+                    # typically reconnect once it is re-activated) instead of
+                    # a connection hanging against a dead service.
+                    await self._close_backend_ws_legs(locked_name)
 
             # Activate self
             lifecycle = self.lifecycle_configs.get(backend.name)
@@ -635,6 +646,27 @@ class LockProxy:
                 except Exception as e:
                     logger.debug(f"Error closing streaming response: {e}")
 
+    async def _close_backend_ws_legs(self, backend_name: str) -> None:
+        """Close all open WebSocket legs to a backend.
+
+        Called when a backend is deactivated (its service is stopped).
+        Without this, legs would keep a dead service's address open and
+        clients would hang instead of seeing a clean disconnect (and
+        reconnecting once the backend is re-activated).
+        """
+        legs = self.ws_legs.get(backend_name)
+        if not legs:
+            return
+        for leg in list(legs):
+            try:
+                await leg.close()
+            except Exception:
+                pass
+        self.ws_legs.pop(backend_name, None)
+        logger.info(
+            f"Closed {len(legs)} WebSocket leg(s) to deactivated backend '{backend_name}'"
+        )
+
     async def _handle_websocket(self, websocket: WebSocket, path: str) -> None:
         full_path = f"/{path}"
         host = websocket.headers.get("host", "")
@@ -664,32 +696,34 @@ class LockProxy:
                 if result and result.path:
                     full_path = result.path
 
-        # Get locks within same domain
+        # Locking policy for WebSocket sessions:
+        # - Cross-backend locks (locks:) are NEVER acquired for a WS session.
+        #   A WS session can stay open for hours (a parked chat tab, a phone
+        #   left on a TTS page); holding locks: for its lifetime would
+        #   exclusive-lock the rest of the domain the whole time. locks:
+        #   only applies to HTTP request/response (and SSE stream) lifetimes.
+        # - The self-lock + activation path IS taken, so on_activate runs and
+        #   the backend is marked in-use (its service is up and a client is
+        #   connected) for the duration of the session.
         domain = self.domains[backend.domain_name]
-        lock_targets = backend.get_lock_targets(domain.backends)
+        lock_targets = []  # WS sessions skip cross-backend locks
 
-        acquired = True
-        if lock_targets:
-            acquired = await domain.lock_manager.acquire(backend.name, lock_targets)
-        if not acquired:
-            await websocket.close(code=1013, reason="Locked")
-            return
+        if backend.locks and backend.name not in self._ws_lock_warned:
+            self._ws_lock_warned.add(backend.name)
+            logger.warning(
+                f"Backend '{backend.name}' declares locks: {backend.locks}, but "
+                f"WebSocket sessions never take cross-backend locks, so those "
+                f"locks do not apply to its WebSocket paths (its HTTP paths are "
+                f"unaffected). Remove locks: from this backend if it only serves "
+                f"WebSockets."
+            )
 
         if backend.name not in self.activated_backends:
             self.activated_backends.add(backend.name)
 
+            # Self-lock: marks the backend in-use while the session is open
+            # (released in the finally block when the last session ends).
             await domain.lock_manager.acquire(backend.name, [backend.name])
-
-            for locked_name in lock_targets:
-                locked_lifecycle = self.lifecycle_configs.get(locked_name)
-                if locked_lifecycle and locked_lifecycle.on_deactivate:
-                    logger.info(f"[{backend.name}] Stopping locked backend '{locked_name}'")
-                    await self.lifecycle_executor.execute(
-                        locked_name, locked_lifecycle.on_deactivate, is_activate=False
-                    )
-                    # Service just stopped: clear its activation so the next
-                    # request re-runs its on_activate (see HTTP handler).
-                    self.activated_backends.discard(locked_name)
 
             lifecycle = self.lifecycle_configs.get(backend.name)
             if lifecycle and lifecycle.on_activate:
@@ -750,18 +784,19 @@ class LockProxy:
                 filtered_headers["referer"] = filtered_headers["origin"] + full_path
             
             logger.info(f"Forwarding WebSocket {full_path} → {backend.name} ({ws_url})")
-            
-            # Get connection from pool (reuses existing or creates new)
-            backend_ws = await self.ws_pool.get_connection(
-                backend_name=backend.name,
-                ws_url=ws_url,
+
+            # One dedicated backend leg per client connection (nginx/Caddy
+            # style). No pooling: the leg's lifetime matches the session's.
+            backend_ws = await websockets.connect(
+                ws_url,
                 additional_headers=filtered_headers
             )
-            
+            self.ws_legs.setdefault(backend.name, set()).add(backend_ws)
+
             await websocket.accept(
-                subprotocol=backend_ws.subprotocol if hasattr(backend_ws, "subprotocol") else None
+                subprotocol=backend_ws.subprotocol if backend_ws.subprotocol else None
             )
-            
+
             async def client_to_backend():
                 try:
                     while True:
@@ -775,13 +810,13 @@ class LockProxy:
                 except Exception:
                     pass
                 finally:
-                    # Release back to pool instead of closing
-                    await self.ws_pool.release_connection(
-                        backend_name=backend.name,
-                        ws_url=ws_url,
-                        ws=backend_ws
-                    )
-            
+                    # Close this session's dedicated backend leg
+                    try:
+                        await backend_ws.close()
+                    except Exception:
+                        pass
+                    self.ws_legs.get(backend.name, set()).discard(backend_ws)
+
             async def backend_to_client():
                 try:
                     async for message in backend_ws:
@@ -792,6 +827,16 @@ class LockProxy:
                 except Exception:
                     pass
                 finally:
+                    self.ws_legs.get(backend.name, set()).discard(backend_ws)
+                    # Log when the backend side closed the leg (backend went
+                    # down, or was deactivated): clients typically reconnect,
+                    # so this is the line that makes that loop visible.
+                    if getattr(backend_ws, "close_code", None) is not None:
+                        logger.info(
+                            f"Backend WebSocket leg to '{backend.name}' closed "
+                            f"(code {backend_ws.close_code}) for {full_path}; "
+                            f"client session ending (clients typically reconnect)"
+                        )
                     if websocket.client_state != WebSocketState.DISCONNECTED:
                         try:
                             await websocket.close()
@@ -892,8 +937,9 @@ class LockProxy:
                 yield chunk
 
     async def shutdown(self):
+        for name in list(self.ws_legs):
+            await self._close_backend_ws_legs(name)
         await self.httpx_client.aclose()
-        await self.ws_pool.stop()
 
     async def run(self) -> None:
         import uvicorn
@@ -905,10 +951,7 @@ class LockProxy:
             access_log=False,
         )
         server = uvicorn.Server(config)
-        
-        # Start WebSocket pool
-        await self.ws_pool.start()
-        
+
         try:
             await server.serve()
         finally:

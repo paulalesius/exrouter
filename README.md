@@ -26,7 +26,7 @@ It supports advanced routing needs through **request remapping** and **domain-ba
 - **Hop-by-Hop Header Filtering**: Proper HTTP proxy behavior
 - **Lifecycle Management**: Declarative `lifecycle:` blocks - the single mechanism for starting and stopping a backend's own service. Per phase you pick any combination of systemd units, shell commands, and Python scripts, plus wait conditions. Automatically stops conflicting locked backends on activation. Backends with `locks:` stay running until another conflicting backend activates.
 - **Domain-based Routing & Virtual Hosting**: Optional `domain:` field (supports wildcards). EXRouter can now function as a lightweight reverse proxy / virtual host router without needing Caddy, Nginx or Traefik in front. When a request's `Host` header matches any declared domain, only domain-declaring backends are considered. Multiple backends can share the same domain but serve different paths. Pure path-based backends are automatically skipped in domain-matched requests. Proper `X-Forwarded-*` headers and compression handling are included.
-- **WebSocket Proxy Support**: Automatic WebSocket upgrade handling with proper header forwarding
+- **WebSocket Proxy Support**: Automatic WebSocket upgrade handling with proper header forwarding. Each client connection gets one dedicated backend WebSocket leg for the lifetime of the session (nginx/Caddy style: no connection pooling, no sharing between clients). WebSocket sessions skip `locks:` cross-backend locks (a parked tab must not exclusive-lock the rest of the domain), but they do take the self-lock and activation path, and open legs are closed automatically when the backend is deactivated.
 - **Health & Config Endpoints**: Built-in `/health` and `/config` endpoints for monitoring
 - **Environment Configuration**: Server bind address configurable via `EXROUTER_HOST` and `EXROUTER_PORT`
 - **Error Propagation**: Backend HTTP status codes are forwarded correctly
@@ -372,7 +372,7 @@ The result: predictable, efficient VRAM sharing without complex custom orchestra
 
 - **SSE (Server-Sent Events)**: Streamed line-by-line
 - **Regular responses**: Streamed byte-by-byte
-- **WebSocket**: Automatically upgraded and proxied with proper headers
+- **WebSocket**: Automatically upgraded and proxied with proper headers. Each client session uses one dedicated backend WebSocket leg for its lifetime (nginx/Caddy style: no pooling, no sharing). WebSocket sessions skip `locks:` cross-backend locking but keep the self-lock and activation path, and legs are closed automatically when the backend is deactivated.
 - Backend HTTP status codes (including 4xx and 5xx) are forwarded correctly
 
 ## Endpoints
