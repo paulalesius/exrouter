@@ -386,6 +386,13 @@ class LockProxy:
                     await self.lifecycle_executor.execute(
                         locked_name, locked_lifecycle.on_deactivate, is_activate=False
                     )
+                    # locked_name's service was just stopped, so it must be
+                    # re-activated before the next request for it: remove it
+                    # from activated_backends so its activation block (and its
+                    # on_activate, which restarts the service) runs again.
+                    # Without this the VRAM handoff is one-way: a deactivated
+                    # backend could never be started again.
+                    self.activated_backends.discard(locked_name)
 
             # Activate self
             lifecycle = self.lifecycle_configs.get(backend.name)
@@ -691,6 +698,9 @@ class LockProxy:
                     await self.lifecycle_executor.execute(
                         locked_name, locked_lifecycle.on_deactivate, is_activate=False
                     )
+                    # Service just stopped: clear its activation so the next
+                    # request re-runs its on_activate (see HTTP handler).
+                    self.activated_backends.discard(locked_name)
 
             lifecycle = self.lifecycle_configs.get(backend.name)
             if lifecycle and lifecycle.on_activate:
